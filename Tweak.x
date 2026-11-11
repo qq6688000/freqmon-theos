@@ -121,26 +121,46 @@ static void ioreport_init(void) {
     if (g_ioreportOk || g_freqTried) return;
     g_freqTried = 1;
     @try {
-        // iOS 版 IOReport API 是无参调用（gputoolsd/PowerZoneTelemetry 确认）
-        void *iolib = dlopen("/usr/lib/libIOReport.dylib", RTLD_LAZY);
-        if (!iolib) { dlog("ioreport: dlopen fail"); return; }
-        typedef void *(*f0)(void);
-        typedef void *(*f1)(const void *);
-        f0 createSub = (f0)dlsym(iolib, "IOReportCreateSubscription");
-        f0 createSmp = (f0)dlsym(iolib, "IOReportCreateSamples");
-        f1 copyWithID = (f1)dlsym(iolib, "IOReportCopyChannelsWithID");
-        f0 copyGroup = (f0)dlsym(iolib, "IOReportCopyChannelsInGroup");
-        if (!createSub || !createSmp) { dlog("ioreport: dlsym fail"); return; }
-        dlog("ioreport: dlsym ok");
-        // 匹配 GPU + 订阅 + 采样（全部 0 参数调用，iOS 正确签名）
-        void *m = copyWithID ? copyWithID(IOServiceMatching("AGXAccelerator")) : copyGroup();
-        if (!m) { dlog("ioreport: no channels"); return; }
-        void *sub = createSub();
-        void *smp = createSmp();
-        dlog("ioreport: chans=%p sub=%p smp=%p", m, sub, smp);
+        // 纯 IORegistry：遍历匹配的服务，读频率相关属性（无 libIOReport 调用，安全）
+        dlog("ioreport: pure-IORegistry mode");
         g_ioreportOk = 1;
     } @catch (NSException *e) {
         dlog_ns(@"ioreport init exception: %@", e);
+    }
+}
+
+// 读频率表 + 当前状态，算出 MHz（纯 IORegistry，无 libIOReport 调用）
+static void read_freq_ioreg(double *cpuFreq, double *gpuFreq) {
+    if (!cpuFreq || !gpuFreq) return;
+    @try {
+        io_iterator_t iter = 0;
+        if (IOServiceGetMatchingServices(0, IOServiceMatching("AppleT8120PMGR"), &iter) == KERN_SUCCESS && iter) {
+            io_object_t entry;
+            while ((entry = IOIteratorNext(iter)) != 0) {
+                CFMutableDictionaryRef props = NULL;
+                if (IORegistryEntryCreateCFProperties(entry, &props, kCFAllocatorDefault, 0) == KERN_SUCCESS && props) {
+                    CFArrayRef cs = (CFArrayRef)CFDictionaryGetValue(props, CFSTR("CurrentStates"));
+                    CFArrayRef dvfm = (CFArrayRef)CFDictionaryGetValue(props, CFSTR("DVFMStates"));
+                    if (cs && dvfm) {
+                        dlog("pmgr: CurrentStates=%ld DVFMStates=%ld", (long)CFArrayGetCount(cs), (long)CFArrayGetCount(dvfm));
+                        if (CFArrayGetCount(cs) >= 1 && CFArrayGetCount(dvfm) >= 1) {
+                            CFTypeRef c0 = CFArrayGetValueAtIndex(cs, 0);
+                            int idx = 0;
+                            if (CFGetTypeID(c0)==CFNumberGetTypeID()) CFNumberGetValue((CFNumberRef)c0, kCFNumberIntType, &idx);
+                            if (idx >= 0 && idx < CFArrayGetCount(dvfm)) {
+                                CFTypeRef v = CFArrayGetValueAtIndex(dvfm, idx);
+                                if (CFGetTypeID(v)==CFNumberGetTypeID()) { double d=0; CFNumberGetValue((CFNumberRef)v,kCFNumberDoubleType,&d); if(d>0)*cpuFreq=d; }
+                            }
+                        }
+                    }
+                    CFRelease(props);
+                }
+                IOObjectRelease(entry);
+            }
+            IOObjectRelease(iter);
+        }
+    } @catch (NSException *e) {
+        dlog_ns(@"read_freq_ioreg exception: %@", e);
     }
 }
 
@@ -305,22 +325,8 @@ static void tick(void) {
     @autoreleasepool {
         double cpu = cpu_usage();
         double gpu = gpu_util();
-        // IOReport 采样：无参调用（iOS 正确签名），采样后 dump 结果结构
-        @try {
-            if (g_ioreportOk) {
-                void *iolib = dlopen("/usr/lib/libIOReport.dylib", RTLD_LAZY);
-                if (iolib) {
-                    typedef void *(*f0)(void);
-                    f0 createSmp = (f0)dlsym(iolib, "IOReportCreateSamples");
-                    if (createSmp) {
-                        void *smp = createSmp();
-                        dlog("ioreport sample: %p", smp);
-                    }
-                }
-            }
-        } @catch (NSException *e) {
-            dlog_ns(@"ioreport sample exception: %@", e);
-        }
+        // 纯 IORegistry 读当前频率（无 libIOReport 调用，安全）
+        read_freq_ioreg(&s_cpuFreq, &s_gpuFreq);
         if (g_chart) {
             [g_chart pushSample:cpu gpu:gpu freq:s_cpuFreq];
             NSString *txt = [NSString stringWithFormat:@"CPU %.0f%% %.0fMHz\nGPU %.0f%% %.0fMHz", cpu, s_cpuFreq, gpu, s_gpuFreq];
