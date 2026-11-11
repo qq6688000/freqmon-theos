@@ -7,12 +7,21 @@
 #import <mach/host_info.h>
 #import <mach/mach_host.h>
 #include <IOKit/IOKitLib.h>
+#include <dlfcn.h>
 #include <stdarg.h>
 
 #define LOGPATH "/var/mobile/Library/Logs/freqmon.log"
+#define DUMPPATH "/var/mobile/Library/Logs/freqmon-dump.log"
+
 static void dlog(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     FILE *f = fopen(LOGPATH, "a");
+    if (f) { vfprintf(f, fmt, ap); fputc('\n', f); fclose(f); }
+    va_end(ap);
+}
+static void dump_line(const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    FILE *f = fopen(DUMPPATH, "a");
     if (f) { vfprintf(f, fmt, ap); fputc('\n', f); fclose(f); }
     va_end(ap);
 }
@@ -57,7 +66,6 @@ static NSDictionary *ioPropsForClass(NSString *className) {
 }
 
 static NSDictionary *ioPropsForService(NSString *className) {
-    // Get first matching service (singular)
     @try {
         CFMutableDictionaryRef match = IOServiceMatching(className.UTF8String);
         if (!match) return nil;
@@ -74,14 +82,139 @@ static NSDictionary *ioPropsForService(NSString *className) {
     } @catch (NSException *e) { return nil; }
 }
 
-// ================= Data readers =================
-static double s_gpuUtil = -1;
-static double s_gpuFreq = 0;
-static int s_maxCpuFreq = 0;
-static double s_battCurrent = 0;
-static double s_battTemp = 0;
-static int s_battPercent = 0;
+// ================= IOReport frequency reader =================
+static void *s_iolib = NULL;
+static CFArrayRef (*s_copyAllChannels)(void) = NULL;
+static CFDictionaryRef (*s_createSubscription)(mach_port_t, CFDictionaryRef, CFDictionaryRef*, const char*, ...) = NULL;
+static CFDictionaryRef (*s_createSamples)(CFDictionaryRef, CFDictionaryRef, ...) = NULL;
+static CFDictionaryRef g_subscription = NULL;
+static int s_ioreportReady = 0;
 
+// Discovered channels
+static NSString *s_cpuChannelGroup = nil;
+static NSString *s_gpuChannelGroup = nil;
+static NSString *s_cpuChannelName = nil;
+static NSString *s_gpuChannelName = nil;
+
+static void ioreport_dump_channels(void) {
+    if (!s_copyAllChannels) return;
+    CFArrayRef chans = s_copyAllChannels();
+    if (!chans) { dump_line("IOReportCopyAllChannels returned NULL"); return; }
+    CFIndex cnt = CFArrayGetCount(chans);
+    dump_line("=== IOReport channels: %ld ===", (long)cnt);
+    for (CFIndex i = 0; i < cnt; i++) {
+        CFDictionaryRef ch = (CFDictionaryRef)CFArrayGetValueAtIndex(chans, i);
+        if (!ch) continue;
+        NSDictionary *d = (__bridge NSDictionary *)ch;
+        NSString *name = [d objectForKey:@"ChannelName"];
+        NSString *group = [d objectForKey:@"Group"];
+        NSString *unit = [d objectForKey:@"Unit"];
+        NSString *subGroup = [d objectForKey:@"SubGroup"];
+        NSString *channelID = [d objectForKey:@"ChannelID"];
+        dump_line("  ch[%ld] group=%@ name=%@ unit=%@ subGroup=%@ id=%@",
+                  (long)i, group ?: @"?", name ?: @"?", unit ?: @"?",
+                  subGroup ?: @"?", channelID ?: @"?");
+        
+        // Look for CPU/GPU frequency channels
+        NSString *gLower = [group.lowercaseString stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        NSString *nLower = [name.lowercaseString stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        BOOL isFreq = [nLower containsString:@"freq"] || [nLower containsString:@"performance"] || [nLower containsString:@"state"] || [gLower containsString:@"performance"] || [gLower containsString:@"freq"];
+        BOOL isCpu = [gLower containsString:@"cpu"] || [nLower containsString:@"cpu"];
+        BOOL isGpu = [gLower containsString:@"gpu"] || [gLower containsString:@"agx"] || [nLower containsString:@"gpu"] || [nLower containsString:@"agx"];
+        if (isFreq && isCpu && !s_cpuChannelGroup) { s_cpuChannelGroup = group; s_cpuChannelName = name; }
+        if (isFreq && isGpu && !s_gpuChannelGroup) { s_gpuChannelGroup = group; s_gpuChannelName = name; }
+    }
+    CFRelease(chans);
+    dump_line("=== channel scan done: CPU=[%@/%@] GPU=[%@/%@] ===",
+              s_cpuChannelGroup ?: @"none", s_cpuChannelName ?: @"none",
+              s_gpuChannelGroup ?: @"none", s_gpuChannelName ?: @"none");
+}
+
+static int ioreport_init(void) {
+    if (s_ioreportReady) return 1;
+    s_iolib = dlopen("/usr/lib/libIOReport.dylib", RTLD_LAZY | RTLD_LOCAL);
+    if (!s_iolib) { dlog("ioreport: dlopen failed"); return 0; }
+    s_copyAllChannels = dlsym(s_iolib, "IOReportCopyAllChannels");
+    s_createSubscription = dlsym(s_iolib, "IOReportCreateSubscription");
+    s_createSamples = dlsym(s_iolib, "IOReportCreateSamples");
+    if (!s_copyAllChannels || !s_createSubscription || !s_createSamples) {
+        dlog("ioreport: missing symbols");
+        return 0;
+    }
+    ioreport_dump_channels();
+    
+    // Create subscription for discovered channels
+    if (s_cpuChannelGroup || s_gpuChannelGroup) {
+        // Build channels dict: { group: { "channel-id": { "ChannelName": name } } }
+        NSMutableDictionary *channels = [NSMutableDictionary dictionary];
+        if (s_cpuChannelGroup) {
+            NSDictionary *ch = @{ @"ChannelName": s_cpuChannelName ?: @"" };
+            [channels setObject:@{ @"0": ch } forKey:s_cpuChannelGroup];
+        }
+        if (s_gpuChannelGroup) {
+            NSDictionary *ch = @{ @"ChannelName": s_gpuChannelName ?: @"" };
+            [channels setObject:@{ @"0": ch } forKey:s_gpuChannelGroup];
+        }
+        CFDictionaryRef sub = NULL;
+        s_createSubscription(0, (__bridge CFDictionaryRef)channels, &sub, "FreqMon", 0);
+        if (sub) {
+            g_subscription = sub;  // keep as CF ref
+            dlog("ioreport: subscription created");
+        } else {
+            dlog("ioreport: subscription failed");
+        }
+    }
+    s_ioreportReady = 1;
+    return 1;
+}
+
+// Read frequency from IOReport samples
+static double s_cpuFreq = 0;
+static double s_gpuFreq = 0;
+
+static void ioreport_read_freq(void) {
+    if (!s_ioreportReady || !g_subscription || !s_createSamples) return;
+    @try {
+        CFDictionaryRef samples = s_createSamples(g_subscription, NULL, 0);
+        if (!samples) return;
+        NSDictionary *d = (__bridge NSDictionary *)samples;
+        // Enumerate groups in samples
+        for (NSString *group in d) {
+            NSDictionary *groupDict = [d objectForKey:group];
+            if (!groupDict) continue;
+            // Look for frequency values
+            for (NSString *key in groupDict) {
+                id val = [groupDict objectForKey:key];
+                NSString *desc = [val description];
+                // Check if this contains frequency data
+                if ([desc containsString:@"freq"] || [desc containsString:@"Hz"] || [desc containsString:@"MHz"]) {
+                    dump_line("freq data in %@/%@: %@", group, key, [desc substringToIndex:MIN(desc.length, 200)]);
+                }
+                // Try to extract numeric frequency
+                if ([val isKindOfClass:[NSDictionary class]]) {
+                    NSDictionary *vd = val;
+                    for (NSString *vk in vd) {
+                        id vv = [vd objectForKey:vk];
+                        if ([vk.lowercaseString containsString:@"freq"] || [vk.lowercaseString containsString:@"hz"]) {
+                            double f = [vv doubleValue];
+                            if (f > 0) {
+                                if ([group.lowercaseString containsString:@"gpu"]) s_gpuFreq = f;
+                                else if ([group.lowercaseString containsString:@"cpu"]) s_cpuFreq = f;
+                                dump_line("  found freq %@=%@ -> %.0f", vk, vv, f);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        CFRelease(samples);
+    } @catch (NSException *e) {
+        dlog("ioreport_read exception: %@", e);
+    }
+}
+
+// ================= GPU utilization from IORegistry =================
+static double s_gpuUtil = -1;
 static void readGpuData(void) {
     @try {
         NSDictionary *d = ioPropsForClass(@"AGXAccelerator");
@@ -90,34 +223,13 @@ static void readGpuData(void) {
         if (!ps) return;
         id du = [ps objectForKey:@"Device Utilization %"];
         if (du && [du respondsToSelector:@selector(integerValue)]) s_gpuUtil = (double)[du integerValue];
-        // GPU frequency: try various keys
-        for (NSString *k in @[@"GPU Clock", @"gpuClock", @"Freq", @"frequency", @"GPU Frequency (MHz)", @"GpuCoreClock"]) {
-            id v = [ps objectForKey:k];
-            if (v && [v respondsToSelector:@selector(integerValue)]) { s_gpuFreq = (double)[v integerValue]; break; }
-        }
     } @catch (NSException *e) {}
 }
 
-static void initCpuFreq(void) {
-    @try {
-        NSDictionary *d = ioPropsForClass(@"AppleARMIODevice");
-        if (!d) return;
-        NSData *vs = [d objectForKey:@"voltage-states"];
-        if (vs) {
-            const uint32_t *p = (const uint32_t *)vs.bytes;
-            NSUInteger cnt = vs.length / sizeof(uint32_t);
-            int maxF = 0;
-            for (NSUInteger i = 0; i + 1 < cnt; i += 2) {
-                int freq = (int)p[i];
-                if (freq > maxF && freq < 100000) maxF = freq;
-            }
-            if (maxF > 100000) maxF /= 1000;
-            s_maxCpuFreq = maxF;
-        }
-    } @catch (NSException *e) {}
-    dlog("initCpuFreq max=%d", s_maxCpuFreq);
-}
-
+// ================= Battery =================
+static double s_battCurrent = 0;
+static double s_battTemp = 0;
+static int s_battPercent = 0;
 static void readBattery(void) {
     @try {
         NSDictionary *d = ioPropsForService(@"AppleSmartBattery");
@@ -162,8 +274,6 @@ static void readBattery(void) {
         _gpuHist = [NSMutableArray arrayWithCapacity:80];
         
         CGFloat w = frame.size.width;
-        
-        // Text lines (top area)
         CGFloat ty = 6;
         _line1 = [[UILabel alloc] initWithFrame:CGRectMake(8, ty, w-16, 14)];
         _line1.font = [UIFont systemFontOfSize:10 weight:UIFontWeightBold];
@@ -177,10 +287,8 @@ static void readBattery(void) {
         _line2.text = @"GPU --- MHz  --%";
         [self addSubview:_line2]; ty += 15;
         
-        // Waveform area
         CGFloat waveTop = ty + 2;
         CGFloat waveH = 70;
-        
         _gridLayer = [CAShapeLayer layer];
         _gridLayer.strokeColor = [UIColor colorWithWhite:0.12 alpha:0.6].CGColor;
         _gridLayer.fillColor = [UIColor clearColor].CGColor;
@@ -203,25 +311,14 @@ static void readBattery(void) {
         _gpuWave.lineWidth = 1.2;
         [self.layer addSublayer:_gpuWave];
         
-        // Draw grid
         UIBezierPath *grid = [UIBezierPath bezierPath];
-        for (int i = 1; i < 4; i++) {
-            CGFloat y = waveTop + waveH * i / 4.0;
-            [grid moveToPoint:CGPointMake(0, y)];
-            [grid addLineToPoint:CGPointMake(w, y)];
-        }
-        for (int i = 1; i < 6; i++) {
-            CGFloat x = w * i / 6.0;
-            [grid moveToPoint:CGPointMake(x, waveTop)];
-            [grid addLineToPoint:CGPointMake(x, waveTop + waveH)];
-        }
+        for (int i = 1; i < 4; i++) { CGFloat y = waveTop + waveH * i / 4.0; [grid moveToPoint:CGPointMake(0, y)]; [grid addLineToPoint:CGPointMake(w, y)]; }
+        for (int i = 1; i < 6; i++) { CGFloat x = w * i / 6.0; [grid moveToPoint:CGPointMake(x, waveTop)]; [grid addLineToPoint:CGPointMake(x, waveTop + waveH)]; }
         _gridLayer.path = grid.CGPath;
         
-        // Save wave frame
         objc_setAssociatedObject(self, "waveTop", @(waveTop), OBJC_ASSOCIATION_RETAIN);
         objc_setAssociatedObject(self, "waveH", @(waveH), OBJC_ASSOCIATION_RETAIN);
         
-        // Bottom info lines
         ty = waveTop + waveH + 4;
         _line3 = [[UILabel alloc] initWithFrame:CGRectMake(8, ty, w-16, 12)];
         _line3.font = [UIFont systemFontOfSize:9 weight:UIFontWeightMedium];
@@ -243,48 +340,31 @@ static void readBattery(void) {
     [_gpuHist addObject:@(gpu)];
     while (_cpuHist.count > _maxSamples) [_cpuHist removeObjectAtIndex:0];
     while (_gpuHist.count > _maxSamples) [_gpuHist removeObjectAtIndex:0];
-    
     NSNumber *wtObj = objc_getAssociatedObject(self, "waveTop");
     NSNumber *whObj = objc_getAssociatedObject(self, "waveH");
-    CGFloat waveTop = [wtObj floatValue];
-    CGFloat waveH = [whObj floatValue];
-    CGFloat w = self.bounds.size.width;
+    CGFloat waveTop = [wtObj floatValue], waveH = [whObj floatValue], w = self.bounds.size.width;
     NSInteger n = _cpuHist.count;
     if (n < 2) return;
     CGFloat dx = w / (CGFloat)_maxSamples;
-    
-    // CPU wave
-    {
-        UIBezierPath *p = [UIBezierPath bezierPath];
-        for (NSInteger i = 0; i < n; i++) {
-            CGFloat x = (i + (_maxSamples - n)) * dx;
-            CGFloat v = [_cpuHist[i] floatValue] / 100.0;
-            CGFloat y = waveTop + waveH - v * waveH;
-            if (i == 0) [p moveToPoint:CGPointMake(x, y)];
-            else [p addLineToPoint:CGPointMake(x, y)];
-        }
-        _cpuWave.path = p.CGPath;
+    UIBezierPath *p1 = [UIBezierPath bezierPath];
+    for (NSInteger i = 0; i < n; i++) {
+        CGFloat x = (i + (_maxSamples - n)) * dx, v = [_cpuHist[i] floatValue] / 100.0;
+        CGFloat y = waveTop + waveH - v * waveH;
+        if (i == 0) [p1 moveToPoint:CGPointMake(x, y)]; else [p1 addLineToPoint:CGPointMake(x, y)];
     }
-    // GPU wave
-    {
-        UIBezierPath *p = [UIBezierPath bezierPath];
-        for (NSInteger i = 0; i < n; i++) {
-            CGFloat x = (i + (_maxSamples - n)) * dx;
-            CGFloat v = [_gpuHist[i] floatValue];
-            if (v < 0) v = 0; if (v > 100) v = 100;
-            v /= 100.0;
-            CGFloat y = waveTop + waveH - v * waveH;
-            if (i == 0) [p moveToPoint:CGPointMake(x, y)];
-            else [p addLineToPoint:CGPointMake(x, y)];
-        }
-        _gpuWave.path = p.CGPath;
+    _cpuWave.path = p1.CGPath;
+    UIBezierPath *p2 = [UIBezierPath bezierPath];
+    for (NSInteger i = 0; i < n; i++) {
+        CGFloat x = (i + (_maxSamples - n)) * dx, v = [_gpuHist[i] floatValue];
+        if (v < 0) v = 0; if (v > 100) v = 100; v /= 100.0;
+        CGFloat y = waveTop + waveH - v * waveH;
+        if (i == 0) [p2 moveToPoint:CGPointMake(x, y)]; else [p2 addLineToPoint:CGPointMake(x, y)];
     }
+    _gpuWave.path = p2.CGPath;
 }
 
 - (void)updateText:(NSString *)l1 gpu:(NSString *)l2 info:(NSString *)l3 {
-    _line1.text = l1;
-    _line2.text = l2;
-    _line3.text = l3;
+    _line1.text = l1; _line2.text = l2; _line3.text = l3;
 }
 
 @end
@@ -315,10 +395,8 @@ static void create_window(void) {
         if (scene) g_cachedScene = scene;
         UIWindow *win = nil;
         if (scene) {
-            @try {
-                win = ((id(*)(id, SEL, id))objc_msgSend)([UIWindow alloc],
-                        NSSelectorFromString(@"initWithWindowScene:"), scene);
-            } @catch (NSException *e) { win = nil; }
+            @try { win = ((id(*)(id, SEL, id))objc_msgSend)([UIWindow alloc], NSSelectorFromString(@"initWithWindowScene:"), scene); }
+            @catch (NSException *e) { win = nil; }
         }
         if (!win) win = [[UIWindow alloc] initWithFrame:[[UIScreen mainScreen] bounds]];
         if (!win.windowScene && scene) {
@@ -333,35 +411,30 @@ static void create_window(void) {
         win.hidden = NO;
         g_window = win;
         
-        CGRect vf = CGRectMake(8, 55, 230, 175);
-        g_view = [[FreqMonView alloc] initWithFrame:vf];
+        g_view = [[FreqMonView alloc] initWithFrame:CGRectMake(8, 55, 230, 175)];
         g_view.userInteractionEnabled = NO;
         [win addSubview:g_view];
         
-        dlog("window+card created scene=%@", scene ? @"yes" : @"NIL");
+        dlog("window created scene=%@", scene ? @"yes" : @"NIL");
         
-        // Init frequency table + battery in background
+        // Init IOReport + battery in background
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
-            @autoreleasepool { initCpuFreq(); readBattery(); }
+            @autoreleasepool {
+                readGpuData();
+                readBattery();
+                ioreport_init();
+            }
         });
         
         [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
             @autoreleasepool {
                 double cpu = cpu_usage();
                 double gpu = s_gpuUtil;
-                // Refresh GPU data periodically (lighter than every tick)
-                static int gpuTick = 0;
-                if (++gpuTick % 4 == 0) { readGpuData(); readBattery(); }
-                
-                double cpuFreq = 0;
-                if (s_maxCpuFreq > 0) {
-                    double minF = 600;
-                    cpuFreq = minF + (s_maxCpuFreq - minF) * (cpu / 100.0);
-                }
+                static int tick = 0;
+                if (++tick % 4 == 0) { readGpuData(); readBattery(); ioreport_read_freq(); }
                 
                 [g_view addSampleCPU:cpu gpu:(gpu < 0 ? 0 : gpu)];
-                
-                NSString *l1 = [NSString stringWithFormat:@"CPU %.0f MHz  %.0f%%", cpuFreq, cpu];
+                NSString *l1 = [NSString stringWithFormat:@"CPU %.0f MHz  %.0f%%", s_cpuFreq, cpu];
                 NSString *l2 = [NSString stringWithFormat:@"GPU %.0f MHz  %.0f%%", s_gpuFreq, (gpu < 0 ? 0 : gpu)];
                 NSString *l3 = [NSString stringWithFormat:@"%.1f°C  %.0fmA  %d%%", s_battTemp, s_battCurrent, s_battPercent];
                 [g_view updateText:l1 gpu:l2 info:l3];
@@ -370,7 +443,6 @@ static void create_window(void) {
     }
 }
 
-// ================= Entry =================
 __attribute__((constructor))
 static void freqmon_ctor(void) {
     @autoreleasepool {
@@ -389,9 +461,7 @@ static void freqmon_ctor(void) {
                 create_window();
                 if (!g_window && tries++ < 40) {
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
-                                   dispatch_get_main_queue(), ^{
-                        if (!g_window) create_window();
-                    });
+                                   dispatch_get_main_queue(), ^{ if (!g_window) create_window(); });
                 }
             });
         }
