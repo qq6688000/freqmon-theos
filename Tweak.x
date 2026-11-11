@@ -101,7 +101,7 @@ static NSDictionary *ioPropsForService(NSString *className) {
 
 // ================= IOReport frequency reader =================
 static void *s_iolib = NULL;
-static CFArrayRef (*s_copyAllChannels)(void) = NULL;
+static CFTypeRef (*s_copyAllChannels)(void) = NULL;
 static int s_ioreportReady = 0;
 
 // Discovered channels
@@ -112,46 +112,64 @@ static NSString *s_gpuChannelName = nil;
 
 static void ioreport_dump_channels(void) {
     if (!s_copyAllChannels) return;
-    CFArrayRef chans = s_copyAllChannels();
-    if (!chans) { dump_line("IOReportCopyAllChannels returned NULL"); return; }
-    CFIndex cnt = CFArrayGetCount(chans);
-    dump_line("=== IOReport channels: %ld ===", (long)cnt);
-    for (CFIndex i = 0; i < cnt; i++) {
-        const void *elem = CFArrayGetValueAtIndex(chans, i);
-        if (!elem) { dump_line("  ch[%ld]: NULL", (long)i); continue; }
-        CFTypeID tid = CFGetTypeID(elem);
-        dump_line("  ch[%ld] typeID=%lu", (long)i, (unsigned long)tid);
-        // Dump full description regardless of type (ObjC bridge, safer than CFCopyDescription)
-        @try {
-            NSObject *obj = (__bridge NSObject *)elem;
-            dump_ns(@"  ch[%ld] desc: %@", (long)i, [obj description]);
-        } @catch (NSException *e) {
-            // Maybe not an ObjC object — try CFCopyDescription
-            @try {
-                CFStringRef desc = CFCopyDescription((CFTypeRef)elem);
-                if (desc) {
-                    char buf[4096] = {0};
-                    CFStringGetCString(desc, buf, sizeof(buf), kCFStringEncodingUTF8);
-                    dump_line("  ch[%ld] cfdesc: %s", (long)i, buf);
-                    CFRelease(desc);
-                } else {
-                    dump_line("  ch[%ld] CFCopyDescription returned NULL", (long)i);
-                }
-            } @catch (NSException *e2) {
-                dump_line("  ch[%ld] both desc methods failed", (long)i);
-            }
-        }
-        // If it's a dict, try all standard keys + dump all keys
+    @try {
+        CFTypeRef result = s_copyAllChannels();
+        if (!result) { dump_line("IOReportCopyAllChannels returned NULL"); return; }
+        CFTypeID tid = CFGetTypeID(result);
+        dump_line("IOReportCopyAllChannels typeID=%lu (dict=%lu array=%lu)",
+                  (unsigned long)tid, (unsigned long)CFDictionaryGetTypeID(), (unsigned long)CFArrayGetTypeID());
         if (tid == CFDictionaryGetTypeID()) {
-            NSDictionary *d = CFBridgingRelease(elem);
-            dump_ns(@"  ch[%ld] allKeys: %@", (long)i, [d allKeys]);
-            for (NSString *k in d) {
-                id v = [d objectForKey:k];
-                dump_ns(@"    %@ = %@ (%@)", k, v, NSStringFromClass([v class]));
+            CFDictionaryRef dict = (CFDictionaryRef)result;
+            CFIndex cnt = CFDictionaryGetCount(dict);
+            dump_line("=== IOReport channels (dict): %ld ===", (long)cnt);
+            const void **keys = NULL, **vals = NULL;
+            if (cnt > 0) {
+                keys = malloc(sizeof(void*) * cnt);
+                vals = malloc(sizeof(void*) * cnt);
+                CFDictionaryGetKeysAndValues(dict, keys, vals);
             }
+            for (CFIndex i = 0; i < cnt; i++) {
+                dump_line("  --- key[%ld] ---", (long)i);
+                @try {
+                    NSObject *ko = (__bridge NSObject *)keys[i];
+                    dump_ns(@"  key: %@", [ko description]);
+                } @catch (NSException *e) {
+                    CFStringRef ds = CFCopyDescription((CFTypeRef)keys[i]);
+                    if (ds) { char b[1024]={0}; CFStringGetCString(ds,b,sizeof(b),kCFStringEncodingUTF8); dump_line("  key(cf): %s", b); CFRelease(ds); }
+                }
+                @try {
+                    NSObject *vo = (__bridge NSObject *)vals[i];
+                    dump_ns(@"  val: %@", [vo description]);
+                } @catch (NSException *e) {
+                    CFStringRef ds = CFCopyDescription((CFTypeRef)vals[i]);
+                    if (ds) { char b[4096]={0}; CFStringGetCString(ds,b,sizeof(b),kCFStringEncodingUTF8); dump_line("  val(cf): %s", b); CFRelease(ds); }
+                }
+            }
+            if (keys) free(keys);
+            if (vals) free(vals);
+            CFRelease(dict);
+        } else if (tid == CFArrayGetTypeID()) {
+            CFArrayRef arr = (CFArrayRef)result;
+            CFIndex cnt = CFArrayGetCount(arr);
+            dump_line("=== IOReport channels (array): %ld ===", (long)cnt);
+            for (CFIndex i = 0; i < cnt; i++) {
+                const void *elem = CFArrayGetValueAtIndex(arr, i);
+                @try {
+                    NSObject *o = (__bridge NSObject *)elem;
+                    dump_ns(@"  ch[%ld]: %@", (long)i, [o description]);
+                } @catch (NSException *e) {
+                    dump_line("  ch[%ld]: desc failed", (long)i);
+                }
+            }
+            CFRelease(arr);
+        } else {
+            dump_line("  (unexpected type, try CFShow)");
+            CFStringRef ds = CFCopyDescription((CFTypeRef)result);
+            if (ds) { char b[8192]={0}; CFStringGetCString(ds,b,sizeof(b),kCFStringEncodingUTF8); dump_line("  result: %s", b); CFRelease(ds); }
         }
+    } @catch (NSException *e) {
+        dlog_ns(@"ioreport_dump exception: %@", e);
     }
-    CFRelease(chans);
     dump_line("=== channel scan done ===");
 }
 
