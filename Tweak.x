@@ -13,13 +13,14 @@
 #define LOGPATH "/var/mobile/Library/Logs/freqmon.log"
 #define DUMPPATH "/var/mobile/Library/Logs/freqmon-dump.log"
 
-static void dlog(const char *fmt, ...) {
+// 所有诊断统一写到 freqmon-dump.log（用户一次能读全）
+static void dump_line(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
-    FILE *f = fopen(LOGPATH, "a");
+    FILE *f = fopen(DUMPPATH, "a");
     if (f) { vfprintf(f, fmt, ap); fputc('\n', f); fclose(f); }
     va_end(ap);
 }
-static void dump_line(const char *fmt, ...) {
+static void dlog(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     FILE *f = fopen(DUMPPATH, "a");
     if (f) { vfprintf(f, fmt, ap); fputc('\n', f); fclose(f); }
@@ -100,31 +101,31 @@ static void ioreport_dump_channels(void) {
     CFIndex cnt = CFArrayGetCount(chans);
     dump_line("=== IOReport channels: %ld ===", (long)cnt);
     for (CFIndex i = 0; i < cnt; i++) {
-        CFDictionaryRef ch = (CFDictionaryRef)CFArrayGetValueAtIndex(chans, i);
-        if (!ch) continue;
-        NSDictionary *d = (__bridge NSDictionary *)ch;
-        NSString *name = [d objectForKey:@"ChannelName"];
-        NSString *group = [d objectForKey:@"Group"];
-        NSString *unit = [d objectForKey:@"Unit"];
-        NSString *subGroup = [d objectForKey:@"SubGroup"];
-        NSString *channelID = [d objectForKey:@"ChannelID"];
-        dump_line("  ch[%ld] group=%@ name=%@ unit=%@ subGroup=%@ id=%@",
-                  (long)i, group ?: @"?", name ?: @"?", unit ?: @"?",
-                  subGroup ?: @"?", channelID ?: @"?");
-        
-        // Look for CPU/GPU frequency channels
-        NSString *gLower = [group.lowercaseString stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-        NSString *nLower = [name.lowercaseString stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-        BOOL isFreq = [nLower containsString:@"freq"] || [nLower containsString:@"performance"] || [nLower containsString:@"state"] || [gLower containsString:@"performance"] || [gLower containsString:@"freq"];
-        BOOL isCpu = [gLower containsString:@"cpu"] || [nLower containsString:@"cpu"];
-        BOOL isGpu = [gLower containsString:@"gpu"] || [gLower containsString:@"agx"] || [nLower containsString:@"gpu"] || [nLower containsString:@"agx"];
-        if (isFreq && isCpu && !s_cpuChannelGroup) { s_cpuChannelGroup = group; s_cpuChannelName = name; }
-        if (isFreq && isGpu && !s_gpuChannelGroup) { s_gpuChannelGroup = group; s_gpuChannelName = name; }
+        const void *elem = CFArrayGetValueAtIndex(chans, i);
+        if (!elem) { dump_line("  ch[%ld]: NULL", (long)i); continue; }
+        CFTypeID tid = CFGetTypeID(elem);
+        dump_line("  ch[%ld] typeID=%lu", (long)i, (unsigned long)tid);
+        // Dump full description regardless of type (ObjC bridge, safer than CFCopyDescription)
+        @try {
+            NSObject *obj = (__bridge NSObject *)elem;
+            NSString *desc = [obj description];
+            dump_line("  ch[%ld] desc: %s", (long)i, [desc UTF8String]);
+        } @catch (NSException *e) {
+            dump_line("  ch[%ld] desc exception: %@", (long)i, e);
+        }
+        // If it's a dict, try all standard keys + dump all keys
+        if (tid == CFDictionaryGetTypeID()) {
+            NSDictionary *d = (__bridge NSDictionary *)elem;
+            dump_line("  ch[%ld] allKeys: %@", (long)i, [d allKeys]);
+            // Try every key-value pair
+            for (NSString *k in d) {
+                id v = [d objectForKey:k];
+                dump_line("    %@ = %@ (%@)", k, v, NSStringFromClass([v class]));
+            }
+        }
     }
     CFRelease(chans);
-    dump_line("=== channel scan done: CPU=[%@/%@] GPU=[%@/%@] ===",
-              s_cpuChannelGroup ?: @"none", s_cpuChannelName ?: @"none",
-              s_gpuChannelGroup ?: @"none", s_gpuChannelName ?: @"none");
+    dump_line("=== channel scan done ===");
 }
 
 static int ioreport_init(void) {
