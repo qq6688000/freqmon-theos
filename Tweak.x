@@ -133,31 +133,28 @@ static void ioreport_init(void) {
 static void read_freq_ioreg(double *cpuFreq, double *gpuFreq) {
     if (!cpuFreq || !gpuFreq) return;
     @try {
-        io_iterator_t iter = 0;
-        if (IOServiceGetMatchingServices(0, IOServiceMatching("AppleT8120PMGR"), &iter) == KERN_SUCCESS && iter) {
-            io_object_t entry;
-            while ((entry = IOIteratorNext(iter)) != 0) {
-                CFMutableDictionaryRef props = NULL;
-                if (IORegistryEntryCreateCFProperties(entry, &props, kCFAllocatorDefault, 0) == KERN_SUCCESS && props) {
-                    CFArrayRef cs = (CFArrayRef)CFDictionaryGetValue(props, CFSTR("CurrentStates"));
-                    CFArrayRef dvfm = (CFArrayRef)CFDictionaryGetValue(props, CFSTR("DVFMStates"));
-                    if (cs && dvfm) {
-                        dlog("pmgr: CurrentStates=%ld DVFMStates=%ld", (long)CFArrayGetCount(cs), (long)CFArrayGetCount(dvfm));
-                        if (CFArrayGetCount(cs) >= 1 && CFArrayGetCount(dvfm) >= 1) {
-                            CFTypeRef c0 = CFArrayGetValueAtIndex(cs, 0);
-                            int idx = 0;
-                            if (CFGetTypeID(c0)==CFNumberGetTypeID()) CFNumberGetValue((CFNumberRef)c0, kCFNumberIntType, &idx);
-                            if (idx >= 0 && idx < CFArrayGetCount(dvfm)) {
-                                CFTypeRef v = CFArrayGetValueAtIndex(dvfm, idx);
-                                if (CFGetTypeID(v)==CFNumberGetTypeID()) { double d=0; CFNumberGetValue((CFNumberRef)v,kCFNumberDoubleType,&d); if(d>0)*cpuFreq=d; }
-                            }
-                        }
-                    }
-                    CFRelease(props);
+        // AppleOverclock 方式：读 IODeviceTree:/arm-io/pmgr 的 FixedFreq 属性（当前实时频率）
+        io_service_t pmgr = IORegistryEntryFromPath(0, "IODeviceTree:/arm-io/pmgr");
+        if (pmgr) {
+            CFMutableDictionaryRef props = NULL;
+            if (IORegistryEntryCreateCFProperties(pmgr, &props, kCFAllocatorDefault, 0) == KERN_SUCCESS && props) {
+                // E核当前频率
+                CFTypeRef e = CFDictionaryGetValue(props, CFSTR("ApplePMGRECPUFixedFreq"));
+                if (e && CFGetTypeID(e) == CFNumberGetTypeID()) {
+                    double d = 0; CFNumberGetValue((CFNumberRef)e, kCFNumberDoubleType, &d);
+                    if (d > 0) { *cpuFreq = d; }
                 }
-                IOObjectRelease(entry);
+                // P核当前频率
+                CFTypeRef p = CFDictionaryGetValue(props, CFSTR("ApplePMGRPCPUFixedFreq"));
+                if (p && CFGetTypeID(p) == CFNumberGetTypeID()) {
+                    double d = 0; CFNumberGetValue((CFNumberRef)p, kCFNumberDoubleType, &d);
+                    if (d > 0) { *gpuFreq = d; }  // 暂存 P核频率
+                }
+                CFRelease(props);
             }
-            IOObjectRelease(iter);
+            IOObjectRelease(pmgr);
+        } else {
+            dlog("pmgr: path lookup failed");
         }
     } @catch (NSException *e) {
         dlog_ns(@"read_freq_ioreg exception: %@", e);
