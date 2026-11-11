@@ -85,9 +85,6 @@ static NSDictionary *ioPropsForService(NSString *className) {
 // ================= IOReport frequency reader =================
 static void *s_iolib = NULL;
 static CFArrayRef (*s_copyAllChannels)(void) = NULL;
-static CFDictionaryRef (*s_createSubscription)(mach_port_t, CFDictionaryRef, CFDictionaryRef*, const char*, ...) = NULL;
-static CFDictionaryRef (*s_createSamples)(CFDictionaryRef, CFDictionaryRef, ...) = NULL;
-static CFDictionaryRef g_subscription = NULL;
 static int s_ioreportReady = 0;
 
 // Discovered channels
@@ -135,82 +132,24 @@ static int ioreport_init(void) {
     s_iolib = dlopen("/usr/lib/libIOReport.dylib", RTLD_LAZY | RTLD_LOCAL);
     if (!s_iolib) { dlog("ioreport: dlopen failed"); return 0; }
     s_copyAllChannels = dlsym(s_iolib, "IOReportCopyAllChannels");
-    s_createSubscription = dlsym(s_iolib, "IOReportCreateSubscription");
-    s_createSamples = dlsym(s_iolib, "IOReportCreateSamples");
-    if (!s_copyAllChannels || !s_createSubscription || !s_createSamples) {
-        dlog("ioreport: missing symbols");
-        return 0;
-    }
-    ioreport_dump_channels();
-    
-    // Create subscription for discovered channels
-    if (s_cpuChannelGroup || s_gpuChannelGroup) {
-        // Build channels dict: { group: { "channel-id": { "ChannelName": name } } }
-        NSMutableDictionary *channels = [NSMutableDictionary dictionary];
-        if (s_cpuChannelGroup) {
-            NSDictionary *ch = @{ @"ChannelName": s_cpuChannelName ?: @"" };
-            [channels setObject:@{ @"0": ch } forKey:s_cpuChannelGroup];
-        }
-        if (s_gpuChannelGroup) {
-            NSDictionary *ch = @{ @"ChannelName": s_gpuChannelName ?: @"" };
-            [channels setObject:@{ @"0": ch } forKey:s_gpuChannelGroup];
-        }
-        CFDictionaryRef sub = NULL;
-        s_createSubscription(0, (__bridge CFDictionaryRef)channels, &sub, "FreqMon", 0);
-        if (sub) {
-            g_subscription = sub;  // keep as CF ref
-            dlog("ioreport: subscription created");
-        } else {
-            dlog("ioreport: subscription failed");
-        }
+    if (!s_copyAllChannels) { dlog("ioreport: no IOReportCopyAllChannels"); return 0; }
+    // 只做通道枚举（只读，不订阅/采样，不会崩）
+    @try {
+        ioreport_dump_channels();
+    } @catch (NSException *e) {
+        dlog("ioreport_dump exception: %@", e);
     }
     s_ioreportReady = 1;
     return 1;
 }
 
-// Read frequency from IOReport samples
+// Read frequency from IOReport samples — DISABLED (causes crash, need correct API)
 static double s_cpuFreq = 0;
 static double s_gpuFreq = 0;
 
-static void ioreport_read_freq(void) {
-    if (!s_ioreportReady || !g_subscription || !s_createSamples) return;
-    @try {
-        CFDictionaryRef samples = s_createSamples(g_subscription, NULL, 0);
-        if (!samples) return;
-        NSDictionary *d = (__bridge NSDictionary *)samples;
-        // Enumerate groups in samples
-        for (NSString *group in d) {
-            NSDictionary *groupDict = [d objectForKey:group];
-            if (!groupDict) continue;
-            // Look for frequency values
-            for (NSString *key in groupDict) {
-                id val = [groupDict objectForKey:key];
-                NSString *desc = [val description];
-                // Check if this contains frequency data
-                if ([desc containsString:@"freq"] || [desc containsString:@"Hz"] || [desc containsString:@"MHz"]) {
-                    dump_line("freq data in %@/%@: %@", group, key, [desc substringToIndex:MIN(desc.length, 200)]);
-                }
-                // Try to extract numeric frequency
-                if ([val isKindOfClass:[NSDictionary class]]) {
-                    NSDictionary *vd = val;
-                    for (NSString *vk in vd) {
-                        id vv = [vd objectForKey:vk];
-                        if ([vk.lowercaseString containsString:@"freq"] || [vk.lowercaseString containsString:@"hz"]) {
-                            double f = [vv doubleValue];
-                            if (f > 0) {
-                                if ([group.lowercaseString containsString:@"gpu"]) s_gpuFreq = f;
-                                else if ([group.lowercaseString containsString:@"cpu"]) s_cpuFreq = f;
-                                dump_line("  found freq %@=%@ -> %.0f", vk, vv, f);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        CFRelease(samples);
-    } @catch (NSException *e) {
-        dlog("ioreport_read exception: %@", e);
-    }
+static __attribute__((unused)) void ioreport_read_freq(void) {
+    // TODO: after we know the correct IOReport API from the channel dump,
+    // implement sampling here. For now this is a no-op to avoid crashing SB.
 }
 
 // ================= GPU utilization from IORegistry =================
