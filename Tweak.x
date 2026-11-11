@@ -170,7 +170,6 @@ static void run_discovery(void) {
 // ================= Floating window =================
 static UIWindow *g_window;
 static UILabel *g_label;
-static int g_dumpStarted = 0;
 
 static void tick(void);
 
@@ -269,16 +268,18 @@ static void freqmon_ctor(void) {
             });
             // SpringBoard 早期 scene 可能还没就绪 —— 反复尝试直到窗口建成为止
             static int tries = 0;
-            void (^tryCreate)(void) = ^{
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
                 if (g_window) return;
                 create_window();
-                if (!g_window && ++tries < 40) {
+                if (!g_window && tries++ < 40) {
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
-                                   dispatch_get_main_queue(), tryCreate);
+                                   dispatch_get_main_queue(), ^{
+                        if (g_window) return;
+                        create_window();
+                    });
                 }
-            };
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), tryCreate);
+            });
         }
     }
 }
