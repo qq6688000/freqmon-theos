@@ -121,70 +121,27 @@ static void ioreport_init(void) {
     if (g_ioreportOk || g_freqTried) return;
     g_freqTried = 1;
     @try {
-        // 找含 IOReportChannels 属性的服务（用匹配字典遍历所有 IORegistry 服务太慢，
-        // 用 IOServiceGetMatchingServices 遍历 IOReport 相关类）
-        // A16: 走 IOServiceGetMatchingServices(NULL) 匹配所有，检查属性
-        io_iterator_t iter = 0;
-        kern_return_t kr = IOServiceGetMatchingServices(0, IOServiceMatching("IOReport"), &iter);
-        // 若上面失败，尝试遍历 AGXAccelerator / pmgr / clpc
-        if (kr != KERN_SUCCESS || !iter) {
-            kr = IOServiceGetMatchingServices(0, IOServiceMatching("AppleARMIODevice"), &iter);
-        }
-        if (kr != KERN_SUCCESS || !iter) {
-            dlog("ioreport: no matching service");
-            return;
-        }
-        io_object_t entry;
-        while ((entry = IOIteratorNext(iter)) != 0) {
-            CFMutableDictionaryRef props = NULL;
-            if (IORegistryEntryCreateCFProperties(entry, &props, kCFAllocatorDefault, 0) == KERN_SUCCESS && props) {
-                CFArrayRef chans = (CFArrayRef)CFDictionaryGetValue(props, CFSTR("IOReportChannels"));
-                if (chans && CFGetTypeID(chans) == CFArrayGetTypeID()) {
-                    CFIndex cnt = CFArrayGetCount(chans);
-                    dlog("ioreport: found IOReportChannels count=%ld", (long)cnt);
-                    for (CFIndex i = 0; i < cnt; i++) {
-                        CFDictionaryRef ch = (CFDictionaryRef)CFArrayGetValueAtIndex(chans, i);
-                        if (!ch || CFGetTypeID(ch) != CFDictionaryGetTypeID()) continue;
-                        CFStringRef grp = (CFStringRef)CFDictionaryGetValue(ch, CFSTR("IOReportGroupName"));
-                        CFStringRef sub = (CFStringRef)CFDictionaryGetValue(ch, CFSTR("IOReportSubGroupName"));
-                        CFStringRef stateNames = (CFStringRef)CFDictionaryGetValue(ch, CFSTR("IOReportChannelStateNames"));
-                        if (!grp || !sub) continue;
-                        char gbuf[64]={0}, sbuf[64]={0};
-                        CFStringGetCString(grp, gbuf, sizeof(gbuf), kCFStringEncodingUTF8);
-                        CFStringGetCString(sub, sbuf, sizeof(sbuf), kCFStringEncodingUTF8);
-                        // CPU Complex Performance States
-                        if (strstr(gbuf,"CPU") && strstr(sbuf,"Complex Performance States")) {
-                            dlog("  CPU freq channel: %s/%s stateNames=%s", gbuf, sbuf, stateNames ? "yes" : "no");
-                        }
-                        if (strstr(gbuf,"GPU") && strstr(sbuf,"GPU Performance States")) {
-                            dlog("  GPU freq channel: %s/%s stateNames=%s", gbuf, sbuf, stateNames ? "yes" : "no");
-                        }
-                    }
-                }
-                CFRelease(props);
-            }
-            IOObjectRelease(entry);
-        }
-        IOObjectRelease(iter);
+        // iOS 版 IOReport API 是无参调用（gputoolsd/PowerZoneTelemetry 确认）
+        void *iolib = dlopen("/usr/lib/libIOReport.dylib", RTLD_LAZY);
+        if (!iolib) { dlog("ioreport: dlopen fail"); return; }
+        typedef void *(*f0)(void);
+        typedef void *(*f1)(const void *);
+        f0 createSub = (f0)dlsym(iolib, "IOReportCreateSubscription");
+        f0 createSmp = (f0)dlsym(iolib, "IOReportCreateSamples");
+        f1 copyWithID = (f1)dlsym(iolib, "IOReportCopyChannelsWithID");
+        f0 copyGroup = (f0)dlsym(iolib, "IOReportCopyChannelsInGroup");
+        if (!createSub || !createSmp) { dlog("ioreport: dlsym fail"); return; }
+        dlog("ioreport: dlsym ok");
+        // 匹配 GPU + 订阅 + 采样（全部 0 参数调用，iOS 正确签名）
+        void *m = copyWithID ? copyWithID(IOServiceMatching("AGXAccelerator")) : copyGroup();
+        if (!m) { dlog("ioreport: no channels"); return; }
+        void *sub = createSub();
+        void *smp = createSmp();
+        dlog("ioreport: chans=%p sub=%p smp=%p", m, sub, smp);
         g_ioreportOk = 1;
     } @catch (NSException *e) {
         dlog_ns(@"ioreport init exception: %@", e);
     }
-}
-
-// 从状态名提取频率 MHz
-static __attribute__((unused)) int freqFromStateName(const char *name) {
-    if (!name || !name[0]) return 0;
-    const char *p = name;
-    while (*p && !isdigit(*p)) p++;
-    if (*p) return atoi(p);
-    return 0;
-}
-
-// 采样：IORegistry 读当前状态（无 libIOReport 函数调用，安全）
-static void ioreport_sample(void) {
-    // AppleOverclock 通过 IORegistry 属性实时读；这里保留 CPU/GPU 利用率已有。
-    // 频率状态名已由 ioreport_init 读到（后续版本直接用 stateNames + CurrentStates）
 }
 
 // ===== CPU 利用率（host_statistics）=====
@@ -348,7 +305,22 @@ static void tick(void) {
     @autoreleasepool {
         double cpu = cpu_usage();
         double gpu = gpu_util();
-        ioreport_sample();
+        // IOReport 采样：无参调用（iOS 正确签名），采样后 dump 结果结构
+        @try {
+            if (g_ioreportOk) {
+                void *iolib = dlopen("/usr/lib/libIOReport.dylib", RTLD_LAZY);
+                if (iolib) {
+                    typedef void *(*f0)(void);
+                    f0 createSmp = (f0)dlsym(iolib, "IOReportCreateSamples");
+                    if (createSmp) {
+                        void *smp = createSmp();
+                        dlog("ioreport sample: %p", smp);
+                    }
+                }
+            }
+        } @catch (NSException *e) {
+            dlog_ns(@"ioreport sample exception: %@", e);
+        }
         if (g_chart) {
             [g_chart pushSample:cpu gpu:gpu freq:s_cpuFreq];
             NSString *txt = [NSString stringWithFormat:@"CPU %.0f%% %.0fMHz\nGPU %.0f%% %.0fMHz", cpu, s_cpuFreq, gpu, s_gpuFreq];
