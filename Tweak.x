@@ -53,7 +53,7 @@ static double cpu_usage(void) {
 static double gpu_util(void) {
     io_iterator_t iter = 0;
     CFMutableDictionaryRef match = IOServiceMatching("AGXAccelerator");
-    if (IOServiceGetMatchingServices(kIOMainPortDefault, match, &iter) != KERN_SUCCESS) return -1;
+    if (IOServiceGetMatchingServices(0, match, &iter) != KERN_SUCCESS) return -1;
     io_object_t entry;
     double val = -1;
     while ((entry = IOIteratorNext(iter))) {
@@ -126,7 +126,7 @@ static void run_discovery(void) {
     const char *classes[] = {"AGXAccelerator", "AppleARMIODevice", "AppleCLPC", "AppleARMPE", "AppleGPU", "IOGPU", "AppleH8", "AppleH7", "AppleSoc", NULL};
     for (int i = 0; classes[i]; i++) {
         io_iterator_t iter = 0;
-        if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching(classes[i]), &iter) != KERN_SUCCESS) continue;
+        if (IOServiceGetMatchingServices(0, IOServiceMatching(classes[i]), &iter) != KERN_SUCCESS) continue;
         io_object_t entry; int n = 0;
         while ((entry = IOIteratorNext(iter)) && n < 3) {
             CFMutableDictionaryRef props = NULL;
@@ -187,10 +187,6 @@ static UIWindowScene *pick_scene(void) {
                 return (UIWindowScene *)sc;
         }
         if (any) return any;
-    } @catch (__unused NSException *e) {}
-    @try {
-        for (UIWindow *w in [UIApplication sharedApplication].windows)
-            if (w.windowScene) return w.windowScene;
     } @catch (__unused NSException *e) {}
     return nil;
 }
