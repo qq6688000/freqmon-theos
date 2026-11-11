@@ -10,7 +10,6 @@
 #include <stdarg.h>
 
 #define LOGPATH "/var/mobile/Library/Logs/freqmon.log"
-
 static void dlog(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     FILE *f = fopen(LOGPATH, "a");
@@ -36,226 +35,237 @@ static double cpu_usage(void) {
     return (double)(user + sys + nice) / total * 100.0;
 }
 
-// ================= GPU utilization (%) =================
-static double gpu_util(void) {
+// ================= IORegistry helpers =================
+static NSDictionary *ioPropsForClass(NSString *className) {
     @try {
         io_iterator_t iter = 0;
-        CFMutableDictionaryRef match = IOServiceMatching("AGXAccelerator");
-        if (!match) return -1;
-        if (IOServiceGetMatchingServices(0, match, &iter) != KERN_SUCCESS) return -1;
+        CFMutableDictionaryRef match = IOServiceMatching(className.UTF8String);
+        if (!match) return nil;
+        if (IOServiceGetMatchingServices(0, match, &iter) != KERN_SUCCESS) return nil;
         io_object_t entry = IOIteratorNext(iter);
-        if (!entry) { IOObjectRelease(iter); return -1; }
+        if (!entry) { IOObjectRelease(iter); return nil; }
         CFMutableDictionaryRef props = NULL;
-        double util = -1;
+        NSDictionary *result = nil;
         if (IORegistryEntryCreateCFProperties(entry, &props, kCFAllocatorDefault, 0) == KERN_SUCCESS && props) {
-            NSDictionary *d = (__bridge NSDictionary *)props;
-            id v = [d objectForKey:@"PerformanceStatistics"];
-            if (v && [v isKindOfClass:[NSDictionary class]]) {
-                id du = [v objectForKey:@"Device Utilization %"];
-                if (du && [du respondsToSelector:@selector(integerValue)]) util = (double)[du integerValue];
-            }
+            result = [(__bridge NSDictionary *)props copy];
             CFRelease(props);
         }
         IOObjectRelease(entry);
         IOObjectRelease(iter);
-        return util;
-    } @catch (NSException *e) {
-        dlog("gpu_util exception: %@", e);
-        return -1;
-    }
+        return result;
+    } @catch (NSException *e) { return nil; }
 }
 
-// ================= CPU frequency (MHz) =================
-// Read voltage-states from IORegistry AppleARMIODevice — gives available frequency table
-// For current frequency, use PerformanceStates from AppleCLPC
-static int s_maxCpuFreq = 0;  // max CPU freq in MHz
-
-static void init_cpu_freq(void) {
+static NSDictionary *ioPropsForService(NSString *className) {
+    // Get first matching service (singular)
     @try {
-        io_iterator_t iter = 0;
-        CFMutableDictionaryRef match = IOServiceMatching("AppleARMIODevice");
-        if (!match) return;
-        if (IOServiceGetMatchingServices(0, match, &iter) != KERN_SUCCESS) return;
-        io_object_t entry; int maxFreq = 0;
-        while ((entry = IOIteratorNext(iter))) {
-            CFMutableDictionaryRef props = NULL;
-            if (IORegistryEntryCreateCFProperties(entry, &props, kCFAllocatorDefault, 0) == KERN_SUCCESS && props) {
-                NSDictionary *d = (__bridge NSDictionary *)props;
-                // voltage-states is an NSData containing uint32 freq/voltage pairs
-                id vs = [d objectForKey:@"voltage-states"];
-                if (vs && [vs isKindOfClass:[NSData class]]) {
-                    NSData *data = vs;
-                    const uint32_t *p = (const uint32_t *)data.bytes;
-                    NSUInteger cnt = data.length / sizeof(uint32_t);
-                    // pairs: (freq_kHz, voltage) — or (freq_MHz, voltage) depending on device
-                    for (NSUInteger i = 0; i + 1 < cnt; i += 2) {
-                        int freq = (int)p[i];
-                        if (freq > maxFreq && freq < 100000) maxFreq = freq; // sanity: <100GHz
-                    }
-                }
-                id vs5 = [d objectForKey:@"voltage-states5"];
-                if (vs5 && [vs5 isKindOfClass:[NSData class]]) {
-                    NSData *data = vs5;
-                    const uint32_t *p = (const uint32_t *)data.bytes;
-                    NSUInteger cnt = data.length / sizeof(uint32_t);
-                    for (NSUInteger i = 0; i + 1 < cnt; i += 2) {
-                        int freq = (int)p[i];
-                        if (freq > maxFreq && freq < 100000) maxFreq = freq;
-                    }
-                }
-                CFRelease(props);
-            }
-            IOObjectRelease(entry);
+        CFMutableDictionaryRef match = IOServiceMatching(className.UTF8String);
+        if (!match) return nil;
+        io_service_t svc = IOServiceGetMatchingService(0, match);
+        if (!svc) return nil;
+        CFMutableDictionaryRef props = NULL;
+        NSDictionary *result = nil;
+        if (IORegistryEntryCreateCFProperties(svc, &props, kCFAllocatorDefault, 0) == KERN_SUCCESS && props) {
+            result = [(__bridge NSDictionary *)props copy];
+            CFRelease(props);
         }
-        IOObjectRelease(iter);
-        // A16 iPhone 15 Pro Max: P-core max ~3464 MHz, E-core ~2016 MHz
-        // voltage-states freq is in kHz on newer devices, MHz on older
-        if (maxFreq > 100000) maxFreq /= 1000; // kHz -> MHz
-        s_maxCpuFreq = maxFreq;
-        dlog("init_cpu_freq: maxFreq=%d MHz", maxFreq);
-    } @catch (NSException *e) {
-        dlog("init_cpu_freq exception: %@", e);
-    }
+        IOObjectRelease(svc);
+        return result;
+    } @catch (NSException *e) { return nil; }
 }
 
-// Estimate current CPU frequency from utilization (if we can't read actual)
-static double cpu_freq_mhz(void) {
-    // Without IOReport, estimate from load: idle=min, busy=max
-    double cpu = cpu_usage();
-    if (s_maxCpuFreq == 0) return 0;
-    // E-core min ~600 MHz, P-core max ~s_maxCpuFreq
-    double minFreq = 600;
-    double freq = minFreq + (s_maxCpuFreq - minFreq) * (cpu / 100.0);
-    return freq;
+// ================= Data readers =================
+static double s_gpuUtil = -1;
+static double s_gpuFreq = 0;
+static int s_maxCpuFreq = 0;
+static double s_battCurrent = 0;
+static double s_battTemp = 0;
+static int s_battPercent = 0;
+
+static void readGpuData(void) {
+    @try {
+        NSDictionary *d = ioPropsForClass(@"AGXAccelerator");
+        if (!d) return;
+        NSDictionary *ps = [d objectForKey:@"PerformanceStatistics"];
+        if (!ps) return;
+        id du = [ps objectForKey:@"Device Utilization %"];
+        if (du && [du respondsToSelector:@selector(integerValue)]) s_gpuUtil = (double)[du integerValue];
+        // GPU frequency: try various keys
+        for (NSString *k in @[@"GPU Clock", @"gpuClock", @"Freq", @"frequency", @"GPU Frequency (MHz)", @"GpuCoreClock"]) {
+            id v = [ps objectForKey:k];
+            if (v && [v respondsToSelector:@selector(integerValue)]) { s_gpuFreq = (double)[v integerValue]; break; }
+        }
+    } @catch (NSException *e) {}
 }
 
-// ================= ECG Waveform Chart View =================
-@interface FreqMonChartView : UIView {
+static void initCpuFreq(void) {
+    @try {
+        NSDictionary *d = ioPropsForClass(@"AppleARMIODevice");
+        if (!d) return;
+        NSData *vs = [d objectForKey:@"voltage-states"];
+        if (vs) {
+            const uint32_t *p = (const uint32_t *)vs.bytes;
+            NSUInteger cnt = vs.length / sizeof(uint32_t);
+            int maxF = 0;
+            for (NSUInteger i = 0; i + 1 < cnt; i += 2) {
+                int freq = (int)p[i];
+                if (freq > maxF && freq < 100000) maxF = freq;
+            }
+            if (maxF > 100000) maxF /= 1000;
+            s_maxCpuFreq = maxF;
+        }
+    } @catch (NSException *e) {}
+    dlog("initCpuFreq max=%d", s_maxCpuFreq);
+}
+
+static void readBattery(void) {
+    @try {
+        NSDictionary *d = ioPropsForService(@"AppleSmartBattery");
+        if (!d) return;
+        id cur = [d objectForKey:@"Amperage"];
+        if (cur && [cur respondsToSelector:@selector(integerValue)]) s_battCurrent = (double)[cur integerValue] / 1000.0;
+        id tmp = [d objectForKey:@"Temperature"];
+        if (tmp && [tmp respondsToSelector:@selector(integerValue)]) s_battTemp = (double)[tmp integerValue] / 100.0;
+        id cap = [d objectForKey:@"CurrentCapacity"];
+        id mx = [d objectForKey:@"MaxCapacity"];
+        if (cap && mx && [mx integerValue] > 0) s_battPercent = (int)([cap integerValue] * 100 / [mx integerValue]);
+    } @catch (NSException *e) {}
+}
+
+// ================= ECG Waveform View =================
+@interface FreqMonView : UIView {
     CAShapeLayer *_gridLayer;
-    CAShapeLayer *_cpuLayer;
-    CAShapeLayer *_gpuLayer;
-    CAShapeLayer *_freqLayer;
+    CAShapeLayer *_cpuWave;
+    CAShapeLayer *_gpuWave;
     NSMutableArray *_cpuHist;
     NSMutableArray *_gpuHist;
-    NSMutableArray *_freqHist;
-    UILabel *_label;
+    UILabel *_line1;
+    UILabel *_line2;
+    UILabel *_line3;
+    UILabel *_line4;
 }
 @property (nonatomic, assign) NSInteger maxSamples;
 @end
 
-@implementation FreqMonChartView
+@implementation FreqMonView
 
 - (instancetype)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
     if (self) {
-        self.backgroundColor = [UIColor colorWithWhite:0 alpha:0.7];
-        self.layer.cornerRadius = 8;
+        self.backgroundColor = [UIColor colorWithWhite:0.02 alpha:0.82];
+        self.layer.cornerRadius = 10;
         self.layer.masksToBounds = YES;
-        _maxSamples = 120;
-        _cpuHist = [NSMutableArray arrayWithCapacity:120];
-        _gpuHist = [NSMutableArray arrayWithCapacity:120];
-        _freqHist = [NSMutableArray arrayWithCapacity:120];
+        self.layer.borderColor = [UIColor colorWithWhite:0.2 alpha:0.5].CGColor;
+        self.layer.borderWidth = 0.5;
+        _maxSamples = 80;
+        _cpuHist = [NSMutableArray arrayWithCapacity:80];
+        _gpuHist = [NSMutableArray arrayWithCapacity:80];
         
-        // Grid layer
+        CGFloat w = frame.size.width;
+        
+        // Text lines (top area)
+        CGFloat ty = 6;
+        _line1 = [[UILabel alloc] initWithFrame:CGRectMake(8, ty, w-16, 14)];
+        _line1.font = [UIFont systemFontOfSize:10 weight:UIFontWeightBold];
+        _line1.textColor = [UIColor colorWithRed:0.2 green:1.0 blue:0.3 alpha:1.0];
+        _line1.text = @"CPU --- MHz  --%";
+        [self addSubview:_line1]; ty += 15;
+        
+        _line2 = [[UILabel alloc] initWithFrame:CGRectMake(8, ty, w-16, 14)];
+        _line2.font = [UIFont systemFontOfSize:10 weight:UIFontWeightBold];
+        _line2.textColor = [UIColor colorWithRed:0.3 green:0.8 blue:1.0 alpha:1.0];
+        _line2.text = @"GPU --- MHz  --%";
+        [self addSubview:_line2]; ty += 15;
+        
+        // Waveform area
+        CGFloat waveTop = ty + 2;
+        CGFloat waveH = 70;
+        
         _gridLayer = [CAShapeLayer layer];
-        _gridLayer.strokeColor = [UIColor colorWithWhite:0.15 alpha:0.5].CGColor;
+        _gridLayer.strokeColor = [UIColor colorWithWhite:0.12 alpha:0.6].CGColor;
         _gridLayer.fillColor = [UIColor clearColor].CGColor;
         _gridLayer.lineWidth = 0.5;
         [self.layer addSublayer:_gridLayer];
         
-        // CPU trace (green, glowing)
-        _cpuLayer = [CAShapeLayer layer];
-        _cpuLayer.strokeColor = [UIColor colorWithRed:0.2 green:1.0 blue:0.3 alpha:0.95].CGColor;
-        _cpuLayer.fillColor = [UIColor clearColor].CGColor;
-        _cpuLayer.lineWidth = 1.5;
-        _cpuLayer.shadowColor = [UIColor colorWithRed:0.2 green:1.0 blue:0.3 alpha:0.8].CGColor;
-        _cpuLayer.shadowRadius = 3;
-        _cpuLayer.shadowOpacity = 0.8;
-        _cpuLayer.shadowOffset = CGSizeZero;
-        [self.layer addSublayer:_cpuLayer];
+        _cpuWave = [CAShapeLayer layer];
+        _cpuWave.strokeColor = [UIColor colorWithRed:0.2 green:1.0 blue:0.3 alpha:0.95].CGColor;
+        _cpuWave.fillColor = [UIColor clearColor].CGColor;
+        _cpuWave.lineWidth = 1.5;
+        _cpuWave.shadowColor = [UIColor colorWithRed:0.2 green:1.0 blue:0.3 alpha:0.6].CGColor;
+        _cpuWave.shadowRadius = 2;
+        _cpuWave.shadowOpacity = 0.8;
+        _cpuWave.shadowOffset = CGSizeZero;
+        [self.layer addSublayer:_cpuWave];
         
-        // GPU trace (cyan)
-        _gpuLayer = [CAShapeLayer layer];
-        _gpuLayer.strokeColor = [UIColor colorWithRed:0.3 green:0.7 blue:1.0 alpha:0.8].CGColor;
-        _gpuLayer.fillColor = [UIColor clearColor].CGColor;
-        _gpuLayer.lineWidth = 1.2;
-        [self.layer addSublayer:_gpuLayer];
+        _gpuWave = [CAShapeLayer layer];
+        _gpuWave.strokeColor = [UIColor colorWithRed:0.3 green:0.8 blue:1.0 alpha:0.8].CGColor;
+        _gpuWave.fillColor = [UIColor clearColor].CGColor;
+        _gpuWave.lineWidth = 1.2;
+        [self.layer addSublayer:_gpuWave];
         
-        // Freq trace (yellow)
-        _freqLayer = [CAShapeLayer layer];
-        _freqLayer.strokeColor = [UIColor colorWithRed:1.0 green:0.85 blue:0.2 alpha:0.7].CGColor;
-        _freqLayer.fillColor = [UIColor clearColor].CGColor;
-        _freqLayer.lineWidth = 1.0;
-        [self.layer addSublayer:_freqLayer];
+        // Draw grid
+        UIBezierPath *grid = [UIBezierPath bezierPath];
+        for (int i = 1; i < 4; i++) {
+            CGFloat y = waveTop + waveH * i / 4.0;
+            [grid moveToPoint:CGPointMake(0, y)];
+            [grid addLineToPoint:CGPointMake(w, y)];
+        }
+        for (int i = 1; i < 6; i++) {
+            CGFloat x = w * i / 6.0;
+            [grid moveToPoint:CGPointMake(x, waveTop)];
+            [grid addLineToPoint:CGPointMake(x, waveTop + waveH)];
+        }
+        _gridLayer.path = grid.CGPath;
         
-        // Text label (top-left)
-        _label = [[UILabel alloc] initWithFrame:CGRectMake(6, 2, frame.size.width - 8, 14)];
-        _label.font = [UIFont systemFontOfSize:9 weight:UIFontWeightBold];
-        _label.textColor = [UIColor colorWithRed:0.2 green:1.0 blue:0.3 alpha:1.0];
-        _label.numberOfLines = 1;
-        _label.adjustsFontSizeToFitWidth = YES;
-        _label.text = @"FreqMon";
-        [self addSubview:_label];
+        // Save wave frame
+        objc_setAssociatedObject(self, "waveTop", @(waveTop), OBJC_ASSOCIATION_RETAIN);
+        objc_setAssociatedObject(self, "waveH", @(waveH), OBJC_ASSOCIATION_RETAIN);
         
-        [self drawGrid];
+        // Bottom info lines
+        ty = waveTop + waveH + 4;
+        _line3 = [[UILabel alloc] initWithFrame:CGRectMake(8, ty, w-16, 12)];
+        _line3.font = [UIFont systemFontOfSize:9 weight:UIFontWeightMedium];
+        _line3.textColor = [UIColor colorWithWhite:0.7 alpha:1.0];
+        _line3.text = @"--.-°C  --mA  --%";
+        [self addSubview:_line3]; ty += 13;
+        
+        _line4 = [[UILabel alloc] initWithFrame:CGRectMake(8, ty, w-16, 12)];
+        _line4.font = [UIFont systemFontOfSize:8 weight:UIFontWeightRegular];
+        _line4.textColor = [UIColor colorWithWhite:0.5 alpha:0.8];
+        _line4.text = @"A16 • iPhone15,3";
+        [self addSubview:_line4];
     }
     return self;
 }
 
-- (void)drawGrid {
-    UIBezierPath *grid = [UIBezierPath bezierPath];
-    CGFloat w = self.bounds.size.width;
-    CGFloat h = self.bounds.size.height;
-    // Horizontal lines (4 divisions)
-    for (int i = 1; i < 4; i++) {
-        CGFloat y = h * i / 4.0;
-        [grid moveToPoint:CGPointMake(0, y)];
-        [grid addLineToPoint:CGPointMake(w, y)];
-    }
-    // Vertical lines (8 divisions)
-    for (int i = 1; i < 8; i++) {
-        CGFloat x = w * i / 8.0;
-        [grid moveToPoint:CGPointMake(x, 0)];
-        [grid addLineToPoint:CGPointMake(x, h)];
-    }
-    _gridLayer.path = grid.CGPath;
-}
-
-- (void)addSampleCPU:(double)cpu gpu:(double)gpu freq:(double)freq {
+- (void)addSampleCPU:(double)cpu gpu:(double)gpu {
     [_cpuHist addObject:@(cpu)];
     [_gpuHist addObject:@(gpu)];
-    [_freqHist addObject:@(freq)];
     while (_cpuHist.count > _maxSamples) [_cpuHist removeObjectAtIndex:0];
     while (_gpuHist.count > _maxSamples) [_gpuHist removeObjectAtIndex:0];
-    while (_freqHist.count > _maxSamples) [_freqHist removeObjectAtIndex:0];
-    [self setNeedsLayout];
-}
-
-- (void)layoutSubviews {
-    [super layoutSubviews];
-    [self drawGrid];
+    
+    NSNumber *wtObj = objc_getAssociatedObject(self, "waveTop");
+    NSNumber *whObj = objc_getAssociatedObject(self, "waveH");
+    CGFloat waveTop = [wtObj floatValue];
+    CGFloat waveH = [whObj floatValue];
     CGFloat w = self.bounds.size.width;
-    CGFloat h = self.bounds.size.height;
-    CGFloat chartH = h - 16; // leave 16px at top for label
-    CGFloat top = 16;
     NSInteger n = _cpuHist.count;
     if (n < 2) return;
-    
     CGFloat dx = w / (CGFloat)_maxSamples;
     
-    // CPU line (0-100%)
+    // CPU wave
     {
         UIBezierPath *p = [UIBezierPath bezierPath];
         for (NSInteger i = 0; i < n; i++) {
             CGFloat x = (i + (_maxSamples - n)) * dx;
             CGFloat v = [_cpuHist[i] floatValue] / 100.0;
-            CGFloat y = top + chartH - v * chartH;
+            CGFloat y = waveTop + waveH - v * waveH;
             if (i == 0) [p moveToPoint:CGPointMake(x, y)];
             else [p addLineToPoint:CGPointMake(x, y)];
         }
-        _cpuLayer.path = p.CGPath;
+        _cpuWave.path = p.CGPath;
     }
-    // GPU line (0-100%)
+    // GPU wave
     {
         UIBezierPath *p = [UIBezierPath bezierPath];
         for (NSInteger i = 0; i < n; i++) {
@@ -263,35 +273,25 @@ static double cpu_freq_mhz(void) {
             CGFloat v = [_gpuHist[i] floatValue];
             if (v < 0) v = 0; if (v > 100) v = 100;
             v /= 100.0;
-            CGFloat y = top + chartH - v * chartH;
+            CGFloat y = waveTop + waveH - v * waveH;
             if (i == 0) [p moveToPoint:CGPointMake(x, y)];
             else [p addLineToPoint:CGPointMake(x, y)];
         }
-        _gpuLayer.path = p.CGPath;
-    }
-    // Freq line (0 - maxFreq MHz, normalized to 0-1)
-    {
-        UIBezierPath *p = [UIBezierPath bezierPath];
-        double maxF = s_maxCpuFreq > 0 ? s_maxCpuFreq : 3500;
-        for (NSInteger i = 0; i < n; i++) {
-            CGFloat x = (i + (_maxSamples - n)) * dx;
-            CGFloat v = [_freqHist[i] floatValue] / maxF;
-            if (v < 0) v = 0; if (v > 1) v = 1;
-            CGFloat y = top + chartH - v * chartH;
-            if (i == 0) [p moveToPoint:CGPointMake(x, y)];
-            else [p addLineToPoint:CGPointMake(x, y)];
-        }
-        _freqLayer.path = p.CGPath;
+        _gpuWave.path = p.CGPath;
     }
 }
 
-- (void)updateLabel:(NSString *)text { _label.text = text; }
+- (void)updateText:(NSString *)l1 gpu:(NSString *)l2 info:(NSString *)l3 {
+    _line1.text = l1;
+    _line2.text = l2;
+    _line3.text = l3;
+}
 
 @end
 
-// ================= Window & main loop =================
+// ================= Window =================
 static UIWindow *g_window;
-static FreqMonChartView *g_chart;
+static FreqMonView *g_view;
 static __weak UIWindowScene *g_cachedScene;
 
 static UIWindowScene *pick_scene(void) {
@@ -301,8 +301,7 @@ static UIWindowScene *pick_scene(void) {
         for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
             if (![sc isKindOfClass:[UIWindowScene class]]) continue;
             if (!any) any = (UIWindowScene *)sc;
-            if (sc.activationState == UISceneActivationStateForegroundActive)
-                return (UIWindowScene *)sc;
+            if (sc.activationState == UISceneActivationStateForegroundActive) return (UIWindowScene *)sc;
         }
         if (any) return any;
     } @catch (__unused NSException *e) {}
@@ -334,22 +333,38 @@ static void create_window(void) {
         win.hidden = NO;
         g_window = win;
         
-        // Chart view: 200x100 at top-left, below status bar
-        CGRect chartFrame = CGRectMake(8, 55, 220, 90);
-        g_chart = [[FreqMonChartView alloc] initWithFrame:chartFrame];
-        g_chart.userInteractionEnabled = NO;
-        [win addSubview:g_chart];
+        CGRect vf = CGRectMake(8, 55, 230, 175);
+        g_view = [[FreqMonView alloc] initWithFrame:vf];
+        g_view.userInteractionEnabled = NO;
+        [win addSubview:g_view];
         
-        dlog("window+chart created scene=%@", scene ? @"yes" : @"NIL");
+        dlog("window+card created scene=%@", scene ? @"yes" : @"NIL");
         
-        [NSTimer scheduledTimerWithTimeInterval:0.3 repeats:YES block:^(NSTimer *t) {
+        // Init frequency table + battery in background
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
+            @autoreleasepool { initCpuFreq(); readBattery(); }
+        });
+        
+        [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
             @autoreleasepool {
                 double cpu = cpu_usage();
-                double gpu = gpu_util();
-                double freq = cpu_freq_mhz();
-                [g_chart addSampleCPU:cpu gpu:gpu freq:freq];
-                [g_chart updateLabel:[NSString stringWithFormat:@"CPU %.0f%% GPU %.0f%%  %.0fMHz",
-                    cpu, (gpu < 0 ? 0 : gpu), freq]];
+                double gpu = s_gpuUtil;
+                // Refresh GPU data periodically (lighter than every tick)
+                static int gpuTick = 0;
+                if (++gpuTick % 4 == 0) { readGpuData(); readBattery(); }
+                
+                double cpuFreq = 0;
+                if (s_maxCpuFreq > 0) {
+                    double minF = 600;
+                    cpuFreq = minF + (s_maxCpuFreq - minF) * (cpu / 100.0);
+                }
+                
+                [g_view addSampleCPU:cpu gpu:(gpu < 0 ? 0 : gpu)];
+                
+                NSString *l1 = [NSString stringWithFormat:@"CPU %.0f MHz  %.0f%%", cpuFreq, cpu];
+                NSString *l2 = [NSString stringWithFormat:@"GPU %.0f MHz  %.0f%%", s_gpuFreq, (gpu < 0 ? 0 : gpu)];
+                NSString *l3 = [NSString stringWithFormat:@"%.1f°C  %.0fmA  %d%%", s_battTemp, s_battCurrent, s_battPercent];
+                [g_view updateText:l1 gpu:l2 info:l3];
             }
         }];
     }
@@ -367,10 +382,6 @@ static void freqmon_ctor(void) {
                  || [bid isEqualToString:@"com.apple.UIKit"];
         dlog("ctor: bid=%@ pname=%@ isSB=%d", bid, pname, (int)isSB);
         if (isSB) {
-            // Init frequency table (safe, wrapped in @try)
-            dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
-                @autoreleasepool { init_cpu_freq(); }
-            });
             static int tries = 0;
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
