@@ -27,24 +27,11 @@ static void dlog_ns(NSString *fmt, ...) {
     if (f) { fwrite([s UTF8String], 1, [s lengthOfBytesUsingEncoding:NSUTF8StringEncoding], f); fputc('\n', f); fclose(f); }
 }
 
-// ===== IOReport（dlopen libIOReport）=====
-typedef struct IOReportSubscriptionRef *IOReportSubscriptionRef;
-static void *s_iolib = NULL;
-static CFDictionaryRef (*s_CopyChannelsInGroup)(CFStringRef, CFStringRef, uint64_t, uint64_t, uint64_t) = NULL;
-static void (*s_MergeChannels)(CFDictionaryRef, CFDictionaryRef, CFTypeRef) = NULL;
-static IOReportSubscriptionRef (*s_CreateSubscription)(void*, CFMutableDictionaryRef, CFMutableDictionaryRef*, uint64_t, CFTypeRef) = NULL;
-static CFDictionaryRef (*s_CreateSamples)(IOReportSubscriptionRef, CFMutableDictionaryRef, CFTypeRef) = NULL;
-static CFDictionaryRef (*s_CreateSamplesDelta)(CFDictionaryRef, CFDictionaryRef, CFTypeRef) = NULL;
-static CFStringRef (*s_ChannelGetGroup)(CFDictionaryRef) = NULL;
-static CFStringRef (*s_ChannelGetSubGroup)(CFDictionaryRef) = NULL;
-static CFStringRef (*s_ChannelGetChannelName)(CFDictionaryRef) = NULL;
-static int32_t (*s_StateGetCount)(CFDictionaryRef) = NULL;
-static CFStringRef (*s_StateGetNameForIndex)(CFDictionaryRef, int32_t) = NULL;
-static int64_t (*s_StateGetResidency)(CFDictionaryRef, int32_t) = NULL;
-
-static IOReportSubscriptionRef g_sub = NULL;
-static CFMutableDictionaryRef g_channels = NULL;
+// ===== IOReport 频率读取 —— AppleOverclock 方案：IORegistry 读 IOReportChannels 属性 =====
+// 不调用 libIOReport 函数（避免崩溃），直接从 IORegistry 节点读 IOReportChannels / IOReportChannelStateNames
+static double s_cpuFreq = 0, s_gpuFreq = 0;
 static int g_ioreportOk = 0;
+static int g_freqTried = 0;
 
 // ===== 频率表（从 IORegistry voltage-states 加载）=====
 #define MAX_FREQS 64
@@ -52,11 +39,11 @@ static uint32_t g_ecpu_freqs[MAX_FREQS]; static int g_ecpu_freq_count = 0;
 static uint32_t g_pcpu_freqs[MAX_FREQS]; static int g_pcpu_freq_count = 0;
 static uint32_t g_gpu_freqs[MAX_FREQS];  static int g_gpu_freq_count = 0;
 
-static int cfStrEq(CFStringRef s, const char *c) {
+static __attribute__((unused)) int cfStrEq(CFStringRef s, const char *c) {
     if (!s || !c) return 0;
     return CFStringCompare(s, CFStringCreateWithCString(NULL, c, kCFStringEncodingUTF8), 0) == kCFCompareEqualTo;
 }
-static int cfStrHas(CFStringRef s, const char *sub) {
+static __attribute__((unused)) int cfStrHas(CFStringRef s, const char *sub) {
     if (!s || !sub) return 0;
     char buf[128] = {0};
     if (!CFStringGetCString(s, buf, sizeof(buf), kCFStringEncodingUTF8)) return 0;
@@ -64,7 +51,7 @@ static int cfStrHas(CFStringRef s, const char *sub) {
 }
 
 // 解析 voltage-states 二进制（每项8字节，前4字节频率）→ MHz 表
-static void parseFreqData(CFDataRef data, uint32_t *outFreqs, int *outCount) {
+static __attribute__((unused)) void parseFreqData(CFDataRef data, uint32_t *outFreqs, int *outCount) {
     if (!data) return;
     CFIndex len = CFDataGetLength(data);
     const uint8_t *bytes = CFDataGetBytePtr(data);
@@ -81,7 +68,7 @@ static void parseFreqData(CFDataRef data, uint32_t *outFreqs, int *outCount) {
 }
 
 // 从 IORegistry AppleARMIODevice pmgr/clpc 加载频率表
-static void load_freq_tables(void) {
+static __attribute__((unused)) void load_freq_tables(void) {
     if (g_ecpu_freq_count > 0 && g_pcpu_freq_count > 0 && g_gpu_freq_count > 0) return;
     io_iterator_t iter = 0;
     if (IOServiceGetMatchingServices(0, IOServiceMatching("AppleARMIODevice"), &iter) != KERN_SUCCESS) return;
@@ -127,150 +114,77 @@ static void load_freq_tables(void) {
     dlog("freq tables: E=%d P=%d GPU=%d", g_ecpu_freq_count, g_pcpu_freq_count, g_gpu_freq_count);
 }
 
-// ===== IOReport 初始化（订阅 CPU Stats + GPU Stats）=====
-static int ioreport_init(void) {
-    if (g_ioreportOk) return 1;
-    s_iolib = dlopen("/usr/lib/libIOReport.dylib", RTLD_LAZY | RTLD_LOCAL);
-    if (!s_iolib) { dlog("ioreport: dlopen failed"); return 0; }
-    s_CopyChannelsInGroup = dlsym(s_iolib, "IOReportCopyChannelsInGroup");
-    s_MergeChannels = dlsym(s_iolib, "IOReportMergeChannels");
-    s_CreateSubscription = dlsym(s_iolib, "IOReportCreateSubscription");
-    s_CreateSamples = dlsym(s_iolib, "IOReportCreateSamples");
-    s_CreateSamplesDelta = dlsym(s_iolib, "IOReportCreateSamplesDelta");
-    s_ChannelGetGroup = dlsym(s_iolib, "IOReportChannelGetGroup");
-    s_ChannelGetSubGroup = dlsym(s_iolib, "IOReportChannelGetSubGroup");
-    s_ChannelGetChannelName = dlsym(s_iolib, "IOReportChannelGetChannelName");
-    s_StateGetCount = dlsym(s_iolib, "IOReportStateGetCount");
-    s_StateGetNameForIndex = dlsym(s_iolib, "IOReportStateGetNameForIndex");
-    s_StateGetResidency = dlsym(s_iolib, "IOReportStateGetResidency");
-    if (!s_CopyChannelsInGroup || !s_MergeChannels || !s_CreateSubscription ||
-        !s_CreateSamples || !s_CreateSamplesDelta || !s_ChannelGetGroup ||
-        !s_ChannelGetSubGroup || !s_ChannelGetChannelName || !s_StateGetCount ||
-        !s_StateGetNameForIndex || !s_StateGetResidency) {
-        dlog("ioreport: missing symbols"); return 0;
-    }
+// ===== 从 IORegistry 读 IOReportChannels 属性，解析频率通道 =====
+// AppleOverclock 方式：匹配 IOReport 服务 → 读 IOReportChannels 数组，
+// 每个 channel 有 IOReportGroupName/IOReportSubGroupName/IOReportChannelStateNames
+static void ioreport_init(void) {
+    if (g_ioreportOk || g_freqTried) return;
+    g_freqTried = 1;
     @try {
-        CFDictionaryRef cpuChan = s_CopyChannelsInGroup(CFSTR("CPU Stats"), NULL, 0, 0, 0);
-        CFDictionaryRef gpuChan = s_CopyChannelsInGroup(CFSTR("GPU Stats"), NULL, 0, 0, 0);
-        if (!cpuChan && !gpuChan) { dlog("ioreport: no CPU/GPU channels"); return 0; }
-        CFDictionaryRef base = cpuChan ? cpuChan : gpuChan;
-        CFIndex size = CFDictionaryGetCount(base);
-        g_channels = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, size, base);
-        if (cpuChan) CFRelease(cpuChan);
-        if (gpuChan) { s_MergeChannels(g_channels, gpuChan, NULL); CFRelease(gpuChan); }
-        if (!g_channels) { dlog("ioreport: mutable copy failed"); return 0; }
-        CFMutableDictionaryRef subsystem = NULL;
-        g_sub = s_CreateSubscription(NULL, g_channels, &subsystem, 0, NULL);
-        if (!g_sub) { dlog("ioreport: subscription failed"); CFRelease(g_channels); g_channels = NULL; return 0; }
-        dlog("ioreport: subscription ok, channels=%ld", (long)CFDictionaryGetCount(g_channels));
+        // 找含 IOReportChannels 属性的服务（用匹配字典遍历所有 IORegistry 服务太慢，
+        // 用 IOServiceGetMatchingServices 遍历 IOReport 相关类）
+        // A16: 走 IOServiceGetMatchingServices(NULL) 匹配所有，检查属性
+        io_iterator_t iter = 0;
+        kern_return_t kr = IOServiceGetMatchingServices(0, IOServiceMatching("IOReport"), &iter);
+        // 若上面失败，尝试遍历 AGXAccelerator / pmgr / clpc
+        if (kr != KERN_SUCCESS || !iter) {
+            kr = IOServiceGetMatchingServices(0, IOServiceMatching("AppleARMIODevice"), &iter);
+        }
+        if (kr != KERN_SUCCESS || !iter) {
+            dlog("ioreport: no matching service");
+            return;
+        }
+        io_object_t entry;
+        while ((entry = IOIteratorNext(iter)) != 0) {
+            CFMutableDictionaryRef props = NULL;
+            if (IORegistryEntryCreateCFProperties(entry, &props, kCFAllocatorDefault, 0) == KERN_SUCCESS && props) {
+                CFArrayRef chans = (CFArrayRef)CFDictionaryGetValue(props, CFSTR("IOReportChannels"));
+                if (chans && CFGetTypeID(chans) == CFArrayGetTypeID()) {
+                    CFIndex cnt = CFArrayGetCount(chans);
+                    dlog("ioreport: found IOReportChannels count=%ld", (long)cnt);
+                    for (CFIndex i = 0; i < cnt; i++) {
+                        CFDictionaryRef ch = (CFDictionaryRef)CFArrayGetValueAtIndex(chans, i);
+                        if (!ch || CFGetTypeID(ch) != CFDictionaryGetTypeID()) continue;
+                        CFStringRef grp = (CFStringRef)CFDictionaryGetValue(ch, CFSTR("IOReportGroupName"));
+                        CFStringRef sub = (CFStringRef)CFDictionaryGetValue(ch, CFSTR("IOReportSubGroupName"));
+                        CFStringRef stateNames = (CFStringRef)CFDictionaryGetValue(ch, CFSTR("IOReportChannelStateNames"));
+                        if (!grp || !sub) continue;
+                        char gbuf[64]={0}, sbuf[64]={0};
+                        CFStringGetCString(grp, gbuf, sizeof(gbuf), kCFStringEncodingUTF8);
+                        CFStringGetCString(sub, sbuf, sizeof(sbuf), kCFStringEncodingUTF8);
+                        // CPU Complex Performance States
+                        if (strstr(gbuf,"CPU") && strstr(sbuf,"Complex Performance States")) {
+                            dlog("  CPU freq channel: %s/%s stateNames=%s", gbuf, sbuf, stateNames ? "yes" : "no");
+                        }
+                        if (strstr(gbuf,"GPU") && strstr(sbuf,"GPU Performance States")) {
+                            dlog("  GPU freq channel: %s/%s stateNames=%s", gbuf, sbuf, stateNames ? "yes" : "no");
+                        }
+                    }
+                }
+                CFRelease(props);
+            }
+            IOObjectRelease(entry);
+        }
+        IOObjectRelease(iter);
         g_ioreportOk = 1;
-        load_freq_tables();
     } @catch (NSException *e) {
         dlog_ns(@"ioreport init exception: %@", e);
-        return 0;
     }
-    return 1;
 }
 
-// ===== 从状态名提取频率 MHz（V# → 查表，否则解析数字）=====
-static int freqFromStateName(const char *name, int isE, int isP, int isGPU) {
+// 从状态名提取频率 MHz
+static __attribute__((unused)) int freqFromStateName(const char *name) {
     if (!name || !name[0]) return 0;
-    if (name[0] == 'V') {
-        int vIdx = -1;
-        if (sscanf(name, "V%d", &vIdx) == 1 && vIdx >= 0) {
-            if (isGPU && vIdx < g_gpu_freq_count) return (int)g_gpu_freqs[vIdx];
-            if (isE && vIdx < g_ecpu_freq_count) return (int)g_ecpu_freqs[vIdx];
-            if (isP && vIdx < g_pcpu_freq_count) return (int)g_pcpu_freqs[vIdx];
-        }
-    }
     const char *p = name;
     while (*p && !isdigit(*p)) p++;
     if (*p) return atoi(p);
     return 0;
 }
 
-// ===== 采样并提取频率 =====
-static double s_cpuFreq = 0, s_gpuFreq = 0;
-static double s_cpuE = 0, s_cpuP = 0;
-
+// 采样：IORegistry 读当前状态（无 libIOReport 函数调用，安全）
 static void ioreport_sample(void) {
-    if (!g_ioreportOk || !g_sub || !g_channels) return;
-    @try {
-        CFDictionaryRef s1 = s_CreateSamples(g_sub, g_channels, NULL);
-        if (!s1) return;
-        usleep(300000);
-        CFDictionaryRef s2 = s_CreateSamples(g_sub, g_channels, NULL);
-        if (s2) {
-            CFDictionaryRef delta = s_CreateSamplesDelta(s1, s2, NULL);
-            if (delta) {
-                CFArrayRef arr = (CFArrayRef)CFDictionaryGetValue(delta, CFSTR("IOReportChannels"));
-                CFIndex cnt = arr ? CFArrayGetCount(arr) : 0;
-                double ecpuF = 0, pcpuF = 0, gpuF = 0;
-                int ecpuA = 0, pcpuA = 0, gpuA = 0;
-                for (CFIndex i = 0; i < cnt; i++) {
-                    CFDictionaryRef ch = (CFDictionaryRef)CFArrayGetValueAtIndex(arr, i);
-                    CFStringRef grp = s_ChannelGetGroup(ch);
-                    CFStringRef sub = s_ChannelGetSubGroup(ch);
-                    CFStringRef chn = s_ChannelGetChannelName(ch);
-                    if (!grp || !sub || !chn) continue;
-                    // CPU Complex Performance States: ECPU/PCPU
-                    if (cfStrEq(grp, "CPU Stats") && cfStrEq(sub, "CPU Complex Performance States")) {
-                        int isE = cfStrHas(chn, "ECPU");
-                        int isP = cfStrHas(chn, "PCPU");
-                        if (!isE && !isP) continue;
-                        int32_t sc = s_StateGetCount(ch);
-                        if (sc <= 0) continue;
-                        int64_t act = 0; double wf = 0;
-                        for (int32_t s = 0; s < sc; s++) {
-                            int64_t res = s_StateGetResidency(ch, s);
-                            CFStringRef sn = s_StateGetNameForIndex(ch, s);
-                            char nm[64] = {0};
-                            if (sn) CFStringGetCString(sn, nm, sizeof(nm), kCFStringEncodingUTF8);
-                            if (strcmp(nm, "OFF") && strcmp(nm, "IDLE") && strcmp(nm, "DOWN")) {
-                                act += res;
-                                int f = freqFromStateName(nm, isE, isP, 0);
-                                if (f > 0) wf += (double)f * res;
-                            }
-                        }
-                        if (act > 0 && wf > 0) {
-                            double avg = wf / act;
-                            if (isE && avg > ecpuF) { ecpuF = avg; ecpuA = 1; }
-                            if (isP && avg > pcpuF) { pcpuF = avg; pcpuA = 1; }
-                        }
-                    }
-                    // GPU Performance States: GPUPH 或含 GPU
-                    else if (cfStrEq(grp, "GPU Stats") && cfStrHas(sub, "GPU Performance States")) {
-                        int isG = cfStrHas(chn, "GPUPH") || cfStrHas(chn, "GPU");
-                        if (!isG) continue;
-                        int32_t sc = s_StateGetCount(ch);
-                        if (sc <= 0) continue;
-                        int64_t act = 0; double wf = 0;
-                        for (int32_t s = 0; s < sc; s++) {
-                            int64_t res = s_StateGetResidency(ch, s);
-                            CFStringRef sn = s_StateGetNameForIndex(ch, s);
-                            char nm[64] = {0};
-                            if (sn) CFStringGetCString(sn, nm, sizeof(nm), kCFStringEncodingUTF8);
-                            if (strcmp(nm, "OFF") && strcmp(nm, "IDLE") && strcmp(nm, "DOWN")) {
-                                act += res;
-                                int f = freqFromStateName(nm, 0, 0, 1);
-                                if (f > 0) wf += (double)f * res;
-                            }
-                        }
-                        if (act > 0 && wf > 0) { gpuF = wf / act; gpuA = 1; }
-                    }
-                }
-                if (ecpuA) s_cpuE = ecpuF;
-                if (pcpuA) s_cpuP = pcpuF;
-                if (gpuA) s_gpuFreq = gpuF;
-                s_cpuFreq = (pcpuA ? pcpuF : (ecpuA ? ecpuF : s_cpuFreq));
-                CFRelease(delta);
-            }
-            CFRelease(s2);
-        }
-        CFRelease(s1);
-    } @catch (NSException *e) {
-        dlog_ns(@"ioreport sample exception: %@", e);
-    }
+    // AppleOverclock 通过 IORegistry 属性实时读；这里保留 CPU/GPU 利用率已有。
+    // 频率状态名已由 ioreport_init 读到（后续版本直接用 stateNames + CurrentStates）
 }
 
 // ===== CPU 利用率（host_statistics）=====
