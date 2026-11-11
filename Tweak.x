@@ -50,7 +50,7 @@ static double cpu_usage(void) {
 }
 
 // ================= GPU utilization (%) =================
-static double gpu_util(void) {
+static double __attribute__((unused)) gpu_util(void) {
     io_iterator_t iter = 0;
     CFMutableDictionaryRef match = IOServiceMatching("AGXAccelerator");
     if (IOServiceGetMatchingServices(0, match, &iter) != KERN_SUCCESS) return -1;
@@ -99,7 +99,7 @@ static void ioreport_init(void) {
 }
 
 // Discovery: dump all IOReport channel names + all relevant IORegistry props (incl. children)
-static void run_discovery(void) {
+static __attribute__((unused)) void run_discovery(void) {
     ensure_dump_started();
     ioreport_init();
     if (g_copyAllChannels) {
@@ -241,9 +241,9 @@ static void create_window(void) {
 static void tick(void) {
     @autoreleasepool {
         double cpu = cpu_usage();
-        double gpu = gpu_util();
-        NSString *txt = [NSString stringWithFormat:@"CPU %4.0f%%\nGPU %4.0f%%\n%ld cores\nCPUf -- MHz\nGPUf -- MHz",
-            cpu, (gpu < 0 ? -1 : gpu), (long)[[NSProcessInfo processInfo] processorCount]];
+        // GPU 暂时禁用（IOKit 调用可能导致崩溃，后续再启用）
+        NSString *txt = [NSString stringWithFormat:@"CPU %4.0f%%\n%ld cores",
+            cpu, (long)[[NSProcessInfo processInfo] processorCount]];
         g_label.text = txt;
     }
 }
@@ -263,10 +263,10 @@ static void freqmon_ctor(void) {
                  || [bid isEqualToString:@"com.apple.UIKit"];
         dlog("isSB=%d bid=%@ pname=%@", (int)isSB, bid, pname);
         if (isSB) {
-            dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
-                @autoreleasepool { run_discovery(); }
-            });
-            // SpringBoard 早期 scene 可能还没就绪 —— 反复尝试直到窗口建成为止
+            // 先只做窗口创建，discovery 暂时禁用（IOKit 调用可能导致 SpringBoard 崩溃）
+            // dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
+            //     @autoreleasepool { run_discovery(); }
+            // });
             static int tries = 0;
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
