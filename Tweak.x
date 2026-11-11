@@ -14,17 +14,33 @@
 #define DUMPPATH "/var/mobile/Library/Logs/freqmon-dump.log"
 
 // 所有诊断统一写到 freqmon-dump.log（用户一次能读全）
+// C 格式版（用于 %d/%s/%ld 等）
 static void dump_line(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     FILE *f = fopen(DUMPPATH, "a");
     if (f) { vfprintf(f, fmt, ap); fputc('\n', f); fclose(f); }
     va_end(ap);
 }
+// ObjC 格式版（用于 %@ 等）
+static void dump_ns(NSString *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    FILE *f = fopen(DUMPPATH, "a");
+    if (f) { fwrite([s UTF8String], 1, [s lengthOfBytesUsingEncoding:NSUTF8StringEncoding], f); fputc('\n', f); fclose(f); }
+}
 static void dlog(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     FILE *f = fopen(DUMPPATH, "a");
     if (f) { vfprintf(f, fmt, ap); fputc('\n', f); fclose(f); }
     va_end(ap);
+}
+static void dlog_ns(NSString *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    FILE *f = fopen(DUMPPATH, "a");
+    if (f) { fwrite([s UTF8String], 1, [s lengthOfBytesUsingEncoding:NSUTF8StringEncoding], f); fputc('\n', f); fclose(f); }
 }
 
 // ================= CPU usage (%) =================
@@ -108,19 +124,30 @@ static void ioreport_dump_channels(void) {
         // Dump full description regardless of type (ObjC bridge, safer than CFCopyDescription)
         @try {
             NSObject *obj = (__bridge NSObject *)elem;
-            NSString *desc = [obj description];
-            dump_line("  ch[%ld] desc: %s", (long)i, [desc UTF8String]);
+            dump_ns(@"  ch[%ld] desc: %@", (long)i, [obj description]);
         } @catch (NSException *e) {
-            dump_line("  ch[%ld] desc exception: %@", (long)i, e);
+            // Maybe not an ObjC object — try CFCopyDescription
+            @try {
+                CFStringRef desc = CFCopyDescription((CFTypeRef)elem);
+                if (desc) {
+                    char buf[4096] = {0};
+                    CFStringGetCString(desc, buf, sizeof(buf), kCFStringEncodingUTF8);
+                    dump_line("  ch[%ld] cfdesc: %s", (long)i, buf);
+                    CFRelease(desc);
+                } else {
+                    dump_line("  ch[%ld] CFCopyDescription returned NULL", (long)i);
+                }
+            } @catch (NSException *e2) {
+                dump_line("  ch[%ld] both desc methods failed", (long)i);
+            }
         }
         // If it's a dict, try all standard keys + dump all keys
         if (tid == CFDictionaryGetTypeID()) {
-            NSDictionary *d = (__bridge NSDictionary *)elem;
-            dump_line("  ch[%ld] allKeys: %@", (long)i, [d allKeys]);
-            // Try every key-value pair
+            NSDictionary *d = CFBridgingRelease(elem);
+            dump_ns(@"  ch[%ld] allKeys: %@", (long)i, [d allKeys]);
             for (NSString *k in d) {
                 id v = [d objectForKey:k];
-                dump_line("    %@ = %@ (%@)", k, v, NSStringFromClass([v class]));
+                dump_ns(@"    %@ = %@ (%@)", k, v, NSStringFromClass([v class]));
             }
         }
     }
@@ -133,12 +160,11 @@ static int ioreport_init(void) {
     s_iolib = dlopen("/usr/lib/libIOReport.dylib", RTLD_LAZY | RTLD_LOCAL);
     if (!s_iolib) { dlog("ioreport: dlopen failed"); return 0; }
     s_copyAllChannels = dlsym(s_iolib, "IOReportCopyAllChannels");
-    if (!s_copyAllChannels) { dlog("ioreport: no IOReportCopyAllChannels"); return 0; }
-    // 只做通道枚举（只读，不订阅/采样，不会崩）
+    if (!s_copyAllChannels) { dlog("ioreport: no IOReportCopyAllChannels"); return 0; }    // 只做通道枚举（只读，不订阅/采样，不会崩）
     @try {
         ioreport_dump_channels();
     } @catch (NSException *e) {
-        dlog("ioreport_dump exception: %@", e);
+        dlog_ns(@"ioreport_dump exception: %@", e);
     }
     s_ioreportReady = 1;
     return 1;
@@ -355,7 +381,7 @@ static void create_window(void) {
         g_view.userInteractionEnabled = NO;
         [win addSubview:g_view];
         
-        dlog("window created scene=%@", scene ? @"yes" : @"NIL");
+        dlog_ns(@"window created scene=%@", scene ? @"yes" : @"NIL");
         
         // Init IOReport + battery in background
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
@@ -392,7 +418,7 @@ static void freqmon_ctor(void) {
         BOOL isSB = [bid isEqualToString:@"com.apple.springboard"]
                  || [pname isEqualToString:@"SpringBoard"]
                  || [bid isEqualToString:@"com.apple.UIKit"];
-        dlog("ctor: bid=%@ pname=%@ isSB=%d", bid, pname, (int)isSB);
+        dlog_ns(@"ctor: bid=%@ pname=%@ isSB=%d", bid, pname, (int)isSB);
         if (isSB) {
             static int tries = 0;
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
