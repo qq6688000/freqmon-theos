@@ -1,0 +1,9 @@
+Package: com.minis.freqmon
+Name: FreqMon (CPU/GPU Monitor)
+Version: 1.0.7
+Architecture: iphoneos-arm64
+Description: SpringBoard floating window monitoring CPU/GPU utilization
+Maintainer: Minis <minis@local>
+Author: Minis
+Section: Tweaks
+Depends: ellekit | mobilesubstrate

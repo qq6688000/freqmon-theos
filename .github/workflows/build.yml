@@ -1,0 +1,70 @@
+name: Build FreqMon
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dpkg and ldid
+        run: brew install dpkg ldid
+
+      - name: Install Theos
+        run: |
+          sudo mkdir -p /opt/theos
+          sudo chown $(whoami) /opt/theos
+          git clone --depth=1 --recursive https://github.com/theos/theos.git /opt/theos
+
+      - name: Install SDK
+        run: |
+          cd /opt/theos/sdks
+          git clone --depth=1 https://github.com/theos/sdks.git sdks-tmp
+          cp -r sdks-tmp/iPhoneOS16.5.sdk .
+          rm -rf sdks-tmp
+
+      - name: Build
+        run: |
+          export THEOS=/opt/theos
+          export THEOS_PACKAGE_SCHEME=rootless
+          make clean || true
+          make FINALPACKAGE=1
+
+      - name: Verify dylib
+        run: |
+          DYLIB=".theos/obj/FreqMon.dylib"
+          echo "=== Architecture ==="
+          lipo -info "$DYLIB" || file "$DYLIB"
+          echo "=== PAC stubs (arm64e) ==="
+          otool -tv -arch arm64e "$DYLIB" | grep -c paciza || echo "0"
+          echo "=== Dependencies ==="
+          otool -L "$DYLIB"
+
+      - name: Convert plist to binary
+        run: |
+          plutil -convert binary1 FreqMon.plist -o FreqMon_bplist.plist
+
+      - name: Stage and build deb
+        run: |
+          DYLIB=".theos/obj/FreqMon.dylib"
+          STAGE="/tmp/freqmon-stage"
+          VERSION=$(grep '^Version:' control | awk '{print $2}')
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE/DEBIAN"
+          mkdir -p "$STAGE/var/jb/Library/MobileSubstrate/DynamicLibraries"
+          cp control "$STAGE/DEBIAN/control"
+          cp "$DYLIB" "$STAGE/var/jb/Library/MobileSubstrate/DynamicLibraries/FreqMon.dylib"
+          cp FreqMon_bplist.plist "$STAGE/var/jb/Library/MobileSubstrate/DynamicLibraries/FreqMon.plist"
+          chmod 755 "$STAGE/var/jb/Library/MobileSubstrate/DynamicLibraries/FreqMon.dylib"
+          dpkg-deb --build --root-owner-group "$STAGE" \
+            "com.minis.freqmon_${VERSION}_iphoneos-arm64.deb"
+
+      - name: Upload deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: freqmon-deb
+          path: com.minis.freqmon_*_iphoneos-arm64.deb
