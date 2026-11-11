@@ -9,6 +9,8 @@
 #import <mach/host_info.h>
 #import <IOKit/IOKitLib.h>
 #import <CoreFoundation/CoreFoundation.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 #define DUMPPATH "/var/mobile/Library/Logs/freqmon-dump.log"
 
@@ -130,6 +132,43 @@ static void ioreport_init(void) {
 }
 
 // 读频率表 + 当前状态，算出 MHz（纯 IORegistry，无 libIOReport 调用）
+
+// dump 属性名+类型+值（诊断用，只 dump 一次）
+static int g_pmgrDumped = 0, g_sgxDumped = 0;
+static void dump_props(CFDictionaryRef props, const char *tag) {
+    if (!props) return;
+    CFIndex cnt = CFDictionaryGetCount(props);
+    if (cnt <= 0) { dlog("%s: (no props)", tag); return; }
+    if (cnt > 128) { dlog("%s: %ld props (too many)", tag, (long)cnt); return; }
+    const void *keys[128], *vals[128];
+    CFDictionaryGetKeysAndValues(props, keys, vals);
+    for (CFIndex i = 0; i < cnt; i++) {
+        CFStringRef k = (CFStringRef)keys[i];
+        char kn[128] = {0};
+        if (!CFStringGetCString(k, kn, sizeof(kn), kCFStringEncodingUTF8)) continue;
+        CFTypeRef v = vals[i];
+        char vd[96] = "";
+        CFTypeID tid = CFGetTypeID(v);
+        if (tid == CFNumberGetTypeID()) {
+            double d = 0; CFNumberGetValue((CFNumberRef)v, kCFNumberDoubleType, &d);
+            snprintf(vd, sizeof(vd), "num=%.0f", d);
+        } else if (tid == CFDataGetTypeID()) {
+            snprintf(vd, sizeof(vd), "data(%ld)", (long)CFDataGetLength((CFDataRef)v));
+        } else if (tid == CFArrayGetTypeID()) {
+            snprintf(vd, sizeof(vd), "array(%ld)", (long)CFArrayGetCount((CFArrayRef)v));
+        } else if (tid == CFDictionaryGetTypeID()) {
+            snprintf(vd, sizeof(vd), "dict(%ld)", (long)CFDictionaryGetCount((CFDictionaryRef)v));
+        } else if (tid == CFStringGetTypeID()) {
+            char sb[64] = {0};
+            if (CFStringGetCString((CFStringRef)v, sb, sizeof(sb), kCFStringEncodingUTF8)) snprintf(vd, sizeof(vd), "str=%s", sb);
+            else snprintf(vd, sizeof(vd), "str");
+        } else {
+            snprintf(vd, sizeof(vd), "type=%lu", (unsigned long)tid);
+        }
+        dlog("%s: %s = %s", tag, kn, vd);
+    }
+}
+
 static void read_freq_ioreg(double *cpuFreq, double *gpuFreq) {
     if (!cpuFreq || !gpuFreq) return;
     @try {
@@ -138,23 +177,38 @@ static void read_freq_ioreg(double *cpuFreq, double *gpuFreq) {
         if (pmgr) {
             CFMutableDictionaryRef props = NULL;
             if (IORegistryEntryCreateCFProperties(pmgr, &props, kCFAllocatorDefault, 0) == KERN_SUCCESS && props) {
-                // E核当前频率
+                if (!g_pmgrDumped) { dlog("--- pmgr props dump ---"); dump_props(props, "pmgr"); g_pmgrDumped = 1; }
                 CFTypeRef e = CFDictionaryGetValue(props, CFSTR("ApplePMGRECPUFixedFreq"));
                 if (e && CFGetTypeID(e) == CFNumberGetTypeID()) {
                     double d = 0; CFNumberGetValue((CFNumberRef)e, kCFNumberDoubleType, &d);
                     if (d > 0) { *cpuFreq = d; }
                 }
-                // P核当前频率
                 CFTypeRef p = CFDictionaryGetValue(props, CFSTR("ApplePMGRPCPUFixedFreq"));
                 if (p && CFGetTypeID(p) == CFNumberGetTypeID()) {
                     double d = 0; CFNumberGetValue((CFNumberRef)p, kCFNumberDoubleType, &d);
-                    if (d > 0) { *gpuFreq = d; }  // 暂存 P核频率
+                    if (d > 0) { *gpuFreq = d; }
                 }
                 CFRelease(props);
+            } else {
+                if (!g_pmgrDumped) { dlog("pmgr: props read FAILED"); g_pmgrDumped = 1; }
             }
             IOObjectRelease(pmgr);
         } else {
-            dlog("pmgr: path lookup failed");
+            if (!g_pmgrDumped) { dlog("pmgr: path lookup failed"); g_pmgrDumped = 1; }
+        }
+        // GPU: /arm-io/sgx
+        io_service_t sgx = IORegistryEntryFromPath(0, "IODeviceTree:/arm-io/sgx");
+        if (sgx) {
+            CFMutableDictionaryRef gprops = NULL;
+            if (IORegistryEntryCreateCFProperties(sgx, &gprops, kCFAllocatorDefault, 0) == KERN_SUCCESS && gprops) {
+                if (!g_sgxDumped) { dlog("--- sgx props dump ---"); dump_props(gprops, "sgx"); g_sgxDumped = 1; }
+                CFRelease(gprops);
+            } else {
+                if (!g_sgxDumped) { dlog("sgx: props read FAILED"); g_sgxDumped = 1; }
+            }
+            IOObjectRelease(sgx);
+        } else {
+            if (!g_sgxDumped) { dlog("sgx: path lookup failed"); g_sgxDumped = 1; }
         }
     } @catch (NSException *e) {
         dlog_ns(@"read_freq_ioreg exception: %@", e);
@@ -335,6 +389,7 @@ static void tick(void) {
 __attribute__((constructor))
 static void freqmon_ctor(void) {
     @autoreleasepool {
+        mkdir("/var/mobile/Library/Logs", 0755);
         NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
         NSString *pname = [[NSProcessInfo processInfo] processName] ?: @"";
         BOOL isSB = [bid isEqualToString:@"com.apple.springboard"] || [pname isEqualToString:@"SpringBoard"];
